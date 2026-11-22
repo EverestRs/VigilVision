@@ -146,4 +146,6 @@ curl -X POST localhost:8000/api/v1/analyze/stream \
 
 ## 许可与依赖注意
 
-YOLOv8（Ultralytics）为 **AGPL-3.0**，商用/闭源分发需评估；ViTPose / SlowFast / ByteTrack / ONNX Runtime / FastAPI 为 MIT，Streamlit 为 Apache-2.0，Qwen2.5-VL 按官方模型许可。数据集：Kinetics-400、COCO、HMDB51（研究用途）。
+本项目采用 **[AGPL-3.0](LICENSE)** 开源许可：衍生作品及对外提供网络服务的修改版本须同样以 AGPL-3.0 开源。选择该许可与核心依赖 YOLOv8（Ultralytics，**AGPL-3.0**）一致，可零成本合规分发；若需闭源商用，需购买 Ultralytics 商业授权或替换检测器。
+
+第三方组件：ViTPose / ByteTrack / ONNX Runtime / FastAPI 为 MIT，SlowFast / Streamlit 为 Apache-2.0，bge-small-zh 为 MIT，Qwen2.5-VL 按官方模型许可。数据集：Kinetics-400、COCO、HMDB51（研究用途）。
