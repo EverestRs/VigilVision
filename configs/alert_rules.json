@@ -1,0 +1,91 @@
+{
+  "rules": [
+    {
+      "rule_id": "rule_0002",
+      "text": "识别有人做出不文明手势",
+      "enabled": false,
+      "created_at": "2026-08-30 13:56:11",
+      "parsed": {
+        "matched_classes": [],
+        "open_description": "有人做出竖中指等侮辱性不文明手势",
+        "use_open_vocabulary": true,
+        "confidence_threshold": 0.6,
+        "reasoning": "超出内置类别，需开放词汇判定",
+        "parser": "vlm"
+      },
+      "stats": {
+        "evaluated": 0,
+        "triggered": 0,
+        "last_triggered_frame": null,
+        "last_triggered_at": null
+      }
+    },
+    {
+      "rule_id": "rule_0003",
+      "text": "告警有人倒地躺下",
+      "enabled": true,
+      "created_at": "2026-08-31 13:14:00",
+      "parsed": {
+        "matched_classes": [
+          "H03"
+        ],
+        "open_description": "有人倒地躺下",
+        "use_open_vocabulary": false,
+        "confidence_threshold": 0.6,
+        "reasoning": "对应内置H03",
+        "parser": "vlm"
+      },
+      "stats": {
+        "evaluated": 0,
+        "triggered": 128,
+        "last_triggered_frame": 210,
+        "last_triggered_at": "2026-11-22 13:10:18",
+        "last_triggered_ts": 1795324218.4014812
+      }
+    },
+    {
+      "rule_id": "rule_0006",
+      "text": "告警有人吸烟",
+      "enabled": true,
+      "created_at": "2026-09-03 09:40:33",
+      "parsed": {
+        "matched_classes": [
+          "M01"
+        ],
+        "open_description": "有人吸烟",
+        "use_open_vocabulary": false,
+        "confidence_threshold": 0.6,
+        "reasoning": "对应内置M01",
+        "parser": "vlm"
+      },
+      "stats": {
+        "evaluated": 0,
+        "triggered": 859,
+        "last_triggered_frame": 1718,
+        "last_triggered_at": "2026-11-22 15:10:28",
+        "last_triggered_ts": 1795331428.6456325
+      }
+    },
+    {
+      "rule_id": "rule_0007",
+      "text": "告警挥手：手臂向上伸展，手掌向前，动作幅度较大，伴随身体轻微摆动",
+      "enabled": true,
+      "created_at": "2026-09-26 15:30:36",
+      "parsed": {
+        "matched_classes": [],
+        "open_description": "挥手：手臂向上伸展，手掌向前，动作幅度大，伴随身体轻微摆动",
+        "use_open_vocabulary": true,
+        "confidence_threshold": 0.6,
+        "reasoning": "挥手动作与内置类别无关",
+        "parser": "vlm"
+      },
+      "stats": {
+        "evaluated": 0,
+        "triggered": 2,
+        "last_triggered_frame": 498,
+        "last_triggered_at": "2026-11-20 17:17:25",
+        "last_triggered_ts": 1795166245.2091775
+      }
+    }
+  ]
+}
