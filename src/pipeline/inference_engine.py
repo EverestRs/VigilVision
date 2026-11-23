@@ -12,6 +12,7 @@ import numpy as np
 from src.core.action_recognizer import ActionRecognizer
 from src.core.alert_adjudicator import AlertAdjudicator
 from src.core.behavior_reasoner import BehaviorReasoner
+from src.core.crop_classifier import CropClassifier, decide_crop_action
 from src.core.detector import Detector
 from src.core.interaction_analyzer import InteractionAnalyzer
 from src.core.nl_rule_engine import NLAlertRuleEngine
@@ -145,6 +146,12 @@ class InferenceEngine:
             cache_lookup=self._vlm_cache.get,
         )
 
+        # 2D crop 分类器（M01/M02/H03 本地确认钥匙）：默认 CPU，避免与检测抢 GPU
+        self.crop_classifier = CropClassifier(dict((model_cfg or {}).get("crop_classifier", {})))
+        self._crop_review_cache: dict[str, tuple[int, str, float]] = {}
+        # M01 提案通道状态：连续命中次数（crop 主提案，规则只做佐证）
+        self._crop_proposal_hits: dict[str, int] = {}
+
         # ── B6: 三阶段流水线（detector/tracker → pose → action/reasoner/post） ──
         _pipeline_cfg = dict((model_cfg or {}).get("inference", {}).get("pipeline", {}))
         self._pipeline_enabled = bool(_pipeline_cfg.get("enabled", False))
@@ -197,6 +204,16 @@ class InferenceEngine:
         fvr_cfg = dict(vlm_cfg.get("force_vlm_review", {}))
         self.force_vlm_classes = {str(c) for c in fvr_cfg.get("classes", []) if str(c)}
         self.force_vlm_throttle_frames = int(max(1, fvr_cfg.get("throttle_frames", 25)))
+        # 复核结论的有效期：VLM 一次往返常需 3–10s（36–120 帧），用 throttle(75) 判定缓存
+        # 会把迟到的否决当"过期"丢弃，导致强几何 H03 的误报永远无法被纠正。
+        self._veto_cache_frames = int(max(self.force_vlm_throttle_frames,
+                                         fvr_cfg.get("veto_cache_frames", 300)))
+        self.geom_strong_parallel_review = bool(fvr_cfg.get("geom_strong_parallel_review", True))
+        self._geom_strong_reviews = 0
+        # 强几何 H03 的"两次同向否决才压制"状态：缓存结论可能抖动，
+        # 单次 VLM 误判 Normal 就压制 15s 会漏掉真实跌倒。
+        self._geom_veto_last_cache: dict[str, int] = {}
+        self._geom_veto_streak: dict[str, int] = {}
         # 全局复核预算：VLM 与 ONNX 共用 GPU，按 track/标签的节流挡不住"多 track/多标签"的叠加，
         # 这里再加一层全局令牌桶（默认 8 次/分钟），保证检测推理始终有 GPU 可用。
         self._review_rate_per_min = float(max(0.0, fvr_cfg.get("max_per_minute", 8)))
@@ -483,8 +500,134 @@ class InferenceEngine:
                 frames.append(hist_frame)
         return frames[:3]
 
+    def _build_crop_discovery_frames(self, track: dict, frame: np.ndarray,
+                                     max_px: int = 1024) -> list[np.ndarray]:
+        """M01 专用输入：仅人物裁剪（外扩 15%），当前帧 + 最近缓冲帧。
+
+        实测：全景会稀释小目标注意力（pano+crop 四种分辨率组合全 0/5），
+        crop-only + 定向 prompt 才能命中（3/5；两帧 5/5）。
+        """
+        bbox = [float(v) for v in track.get("bbox", [0, 0, 0, 0])]
+        x, y, w, h = [int(round(v)) for v in bbox]
+        pad_x, pad_y = int(w * 0.15), int(h * 0.15)
+        frame_h, frame_w = frame.shape[:2]
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(frame_w, x + w + pad_x), min(frame_h, y + h + pad_y)
+
+        def _prepare(img: np.ndarray) -> np.ndarray | None:
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+            ch, cw = crop.shape[:2]
+            scale = float(max_px) / max(1, ch, cw)
+            interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+            return cv2.resize(crop, (max(1, int(cw * scale)), max(1, int(ch * scale))),
+                              interpolation=interp)
+
+        frames: list[np.ndarray] = []
+        current = _prepare(frame)
+        if current is not None:
+            frames.append(current)
+        entries = self.frame_buffer.recent_entries(6)
+        if len(entries) > 1:
+            prev = _prepare(entries[0][1])
+            if prev is not None:
+                frames.append(prev)
+        return frames[:2]
+
+    # 向后兼容旧命名
+    _build_m01_discovery_frames = _build_crop_discovery_frames
+
+    @staticmethod
+    def _crop_resize(frame: np.ndarray, bbox: list[float], max_px: int,
+                     pad_ratio: float = 0.15) -> np.ndarray | None:
+        x, y, w, h = [int(round(float(v))) for v in bbox]
+        pad_x, pad_y = int(w * pad_ratio), int(h * pad_ratio)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(fw, x + w + pad_x), min(fh, y + h + pad_y)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        ch, cw = crop.shape[:2]
+        scale = float(max_px) / max(1, ch, cw)
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        return cv2.resize(crop, (max(1, int(cw * scale)), max(1, int(ch * scale))),
+                          interpolation=interp)
+
+    @staticmethod
+    def _peak_frame(entries: list) -> np.ndarray | None:
+        """在最近缓冲帧里挑帧间差异最大的一帧（运动峰值），而不是固定取上一帧。"""
+        if len(entries) < 2:
+            return None
+        best = None
+        best_score = -1.0
+        prev_gray = None
+        for _, img in entries:
+            try:
+                small = cv2.resize(img, (64, 36), interpolation=cv2.INTER_AREA)
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                continue
+            if prev_gray is not None:
+                score = float(np.mean(cv2.absdiff(gray, prev_gray)))
+                if score > best_score:
+                    best_score = score
+                    best = img
+            prev_gray = gray
+        return best
+
+    def _build_h_single_frames(self, track: dict, frame: np.ndarray,
+                               max_px: int = 1024) -> list[np.ndarray]:
+        """H03/H04/H05：全景（红框）+ 人物裁剪 + 上一帧全景（场景变化参照）。"""
+        frames: list[np.ndarray] = []
+        h, w = frame.shape[:2]
+        scale = min(1.0, 960.0 / max(1, h, w))
+        pano = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale < 1.0 else frame.copy()
+        bbox = [float(v) for v in track.get("bbox", [0, 0, 0, 0])]
+        cv2.rectangle(pano, (int(bbox[0] * scale), int(bbox[1] * scale)),
+                      (int((bbox[0] + bbox[2]) * scale), int((bbox[1] + bbox[3]) * scale)),
+                      (0, 0, 255), 2)
+        frames.append(pano)
+        crop = self._crop_resize(frame, bbox, max_px)
+        if crop is not None:
+            frames.append(crop)
+        entries = self.frame_buffer.recent_entries(8)
+        peak = self._peak_frame(entries)
+        if peak is not None:
+            ph, pw = peak.shape[:2]
+            ps = min(1.0, 720.0 / max(1, ph, pw))
+            frames.append(cv2.resize(peak, (int(pw * ps), int(ph * ps))) if ps < 1.0 else peak)
+        return frames[:3]
+
+    def _build_h_pair_frames(self, track: dict, peer_bbox: list[float] | None,
+                             frame: np.ndarray, max_px: int = 1024) -> list[np.ndarray]:
+        """H01/H02：全景（双框）+ 两名当事人裁剪。"""
+        frames: list[np.ndarray] = []
+        h, w = frame.shape[:2]
+        scale = min(1.0, 960.0 / max(1, h, w))
+        pano = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale < 1.0 else frame.copy()
+        boxes = [track.get("bbox", [0, 0, 0, 0])]
+        if peer_bbox is not None:
+            boxes.append(peer_bbox)
+        for idx, box in enumerate(boxes):
+            b = [float(v) for v in box]
+            color = (0, 0, 255) if idx == 0 else (0, 200, 0)
+            cv2.rectangle(pano, (int(b[0] * scale), int(b[1] * scale)),
+                          (int((b[0] + b[2]) * scale), int((b[1] + b[3]) * scale)), color, 2)
+        frames.append(pano)
+        crop = self._crop_resize(frame, [float(v) for v in track.get("bbox", [0, 0, 0, 0])], max_px)
+        if crop is not None:
+            frames.append(crop)
+        if peer_bbox is not None:
+            peer_crop = self._crop_resize(frame, [float(v) for v in peer_bbox], max_px)
+            if peer_crop is not None:
+                frames.append(peer_crop)
+        return frames[:3]
+
     def _maybe_submit_discovery(self, track: dict, frame: np.ndarray, frame_id: int,
-                                label: str, confidence: float, source: str) -> None:
+                                label: str, confidence: float, source: str,
+                                tracks: list[dict] | None = None) -> None:
         """发现器入口：策略判断（预算/冷却/在飞）→ 后台异步送审，主循环不做等待。"""
         scheduler = getattr(self, "vlm_discovery", None)
         if scheduler is None or not scheduler.enabled:
@@ -495,8 +638,42 @@ class InferenceEngine:
         crop = frame[max(0, y):min(h_f, y + h), max(0, x):min(w_f, x + w)]
         if crop.size == 0:
             return
+        label_text = str(label)
+        track_id = str(track.get("track_id", ""))
+        peer_id = ""
+        peer_bbox: list[float] | None = None
+        channel = "generic"
+        if label_text == "M01":
+            channel = "m01"
+        elif label_text == "M02":
+            channel = "m02"
+        elif label_text in ("H01", "H02"):
+            # 双人事件：按 pair 聚合提案（同一对只占一个冷却槽），并送双方裁剪
+            if tracks:
+                try:
+                    close = self.behavior_reasoner._close_peer_ids(
+                        track_id, bbox, tracks)
+                except Exception:
+                    close = set()
+                for peer in tracks:
+                    pid = str(peer.get("track_id", ""))
+                    if pid and pid != track_id and pid in close:
+                        peer_id = pid
+                        peer_bbox = [float(v) for v in peer.get("bbox", [0, 0, 0, 0])]
+                        break
+            channel = "h_pair" if peer_bbox is not None else "h_single"
+        elif label_text in ("H03", "H04", "H05"):
+            channel = "h_single"
+
+        proposal_track_id = track_id
+        if channel == "h_pair" and peer_id:
+            try:
+                proposal_track_id = self.behavior_reasoner._pair_key(track_id, peer_id)
+            except Exception:
+                proposal_track_id = f"{track_id}:{peer_id}"
+
         proposal = scheduler.maybe_propose(
-            track_id=str(track.get("track_id", "")),
+            track_id=proposal_track_id,
             frame_id=int(frame_id),
             label=str(label),
             confidence=float(confidence),
@@ -504,12 +681,112 @@ class InferenceEngine:
             track_score=float(track.get("score", 0.0)),
             video_time=float(frame_id) / max(1e-6, float(self._source_fps)),
             image_hash=self._frame_dhash(crop),
+            channel=channel,
         )
         if proposal is None:
             return
-        frames = self._build_discovery_frames(track, frame)
+        chan_cfg = (getattr(scheduler, "channels", {}) or {}).get(channel, {})
+        image_max_px = int(chan_cfg.get("image_max_px", 1024))
+        if channel in ("m01", "m02"):
+            frames = self._build_crop_discovery_frames(track, frame, image_max_px)
+        elif channel == "h_pair":
+            frames = self._build_h_pair_frames(track, peer_bbox, frame, image_max_px)
+        elif channel == "h_single":
+            frames = self._build_h_single_frames(track, frame, image_max_px)
+        else:
+            frames = self._build_discovery_frames(track, frame)
         if not frames or not scheduler.submit(proposal, frames):
             scheduler.cancel(proposal)
+
+    def _crop_verdict(self, track: dict, frame: np.ndarray, frame_id: int) -> tuple[str, float]:
+        """按 track 节流运行 crop 分类器，返回 (label, confidence)；不可用时返回 ("", 0)。"""
+        classifier = getattr(self, "crop_classifier", None)
+        if classifier is None or not getattr(classifier, "loaded", False):
+            return "", 0.0
+        track_id = str(track.get("track_id", ""))
+        cached = self._crop_review_cache.get(track_id)
+        if cached is not None and (frame_id - int(cached[0])) < classifier.throttle_frames:
+            return cached[1], cached[2]
+
+        bbox = [float(v) for v in track.get("bbox", [0, 0, 0, 0])]
+        x, y, w, h = [int(round(v)) for v in bbox]
+        frame_h, frame_w = frame.shape[:2]
+        crop = frame[max(0, y):min(frame_h, y + h), max(0, x):min(frame_w, x + w)]
+        result = classifier.predict(crop)
+        pred_label = str(result.get("label", ""))
+        pred_conf = float(result.get("confidence", 0.0))
+        self._crop_review_cache[track_id] = (int(frame_id), pred_label, pred_conf)
+        return pred_label, pred_conf
+
+    def _maybe_crop_proposal(self, track: dict, frame: np.ndarray, frame_id: int,
+                             label: str, confidence: float, src_tag: str,
+                             base_label: str, base_confidence: float) -> tuple[str, float, str, bool]:
+        """crop 主提案通道：连续 N 次判 M01 且过阈值时，在 Normal 帧上提案 M01。
+
+        背景：M01 的 pose 近嘴规则在办公场景误报高（454 帧/900 帧）、吸烟场景覆盖不全；
+        实测 crop 分类器对 M01 的区分度更好（吸烟 96 vs 办公 16）。因此改为 crop 主提案，
+        pose 规则只做佐证（`m01_require_crop` 门控）。
+        """
+        classifier = getattr(self, "crop_classifier", None)
+        if classifier is None or not getattr(classifier, "loaded", False):
+            return label, confidence, src_tag, False
+        if not classifier.propose_m01:
+            return label, confidence, src_tag, False
+
+        track_id = str(track.get("track_id", ""))
+        if label != "Normal":
+            self._crop_proposal_hits[track_id] = 0
+            return label, confidence, src_tag, False
+
+        pred_label, pred_conf = self._crop_verdict(track, frame, frame_id)
+        if pred_label == "M01" and pred_conf >= classifier.proposal_conf:
+            hits = int(self._crop_proposal_hits.get(track_id, 0)) + 1
+        else:
+            hits = 0
+        self._crop_proposal_hits[track_id] = hits
+        if hits >= classifier.proposal_hits:
+            return "M01", max(float(confidence), float(pred_conf)), "crop_proposal", True
+        return label, confidence, src_tag, False
+
+    def _apply_crop_review(self, track: dict, frame: np.ndarray, frame_id: int,
+                           label: str, confidence: float, src_tag: str,
+                           base_label: str, base_confidence: float) -> tuple[str, float, str]:
+        """本地 crop 分类器：M01 规则门控 + M01/M02/H03 确认/否决（按 track 节流缓存）。"""
+        classifier = getattr(self, "crop_classifier", None)
+        if classifier is None or not getattr(classifier, "loaded", False):
+            return label, confidence, src_tag
+        if label not in classifier.review_classes:
+            return label, confidence, src_tag
+
+        pred_label, pred_conf = self._crop_verdict(track, frame, frame_id)
+
+        # M01 规则降级为佐证：crop 不认为是 M01 时，规则候选不再单独成立
+        if label == "M01" and classifier.m01_require_crop and pred_label != "M01":
+            return base_label, base_confidence, "crop_gate_miss"
+
+        new_label, new_conf, new_src, _action = decide_crop_action(
+            label, confidence, src_tag, pred_label, pred_conf,
+            review_classes=classifier.review_classes,
+            thresholds=classifier.class_thresholds,
+            normal_conf=classifier.normal_conf,
+            confirm_alerts=classifier.confirm_alerts,
+            base_label=base_label,
+            base_confidence=base_confidence,
+        )
+        return new_label, new_conf, new_src
+
+    def _geom_veto_allowed(self, track_id: str, cached_frame_id: int, strong_geom: bool) -> bool:
+        """强几何 H03：两次不同缓存结论同向否决才允许压制。
+
+        同一份缓存被连续读到多次只算一票，避免"一帧复核结果压掉整段真跌倒"。
+        """
+        if not strong_geom:
+            return True
+        last = self._geom_veto_last_cache.get(track_id, -1)
+        if last != int(cached_frame_id):
+            self._geom_veto_last_cache[track_id] = int(cached_frame_id)
+            self._geom_veto_streak[track_id] = self._geom_veto_streak.get(track_id, 0) + 1
+        return self._geom_veto_streak.get(track_id, 0) >= 2
 
     def _take_review_token(self) -> bool:
         """全局复核令牌桶：限制 VLM 复核频率，避免抢占检测推理的 GPU。"""
@@ -1208,6 +1485,16 @@ class InferenceEngine:
                 rule_override_count += 1
                 src_tag = "rule"  # 归因：规则引擎覆盖
 
+            # ── 本地 crop 分类器：M01 主提案 + 规则佐证门控 ──
+            # 1) 提案：Normal 帧上连续 N 次判 M01 → 生成 M01 候选（走规则复核门，VLM 确认后才告警）
+            # 2) 门控/否决：pose 规则的 M01 候选若 crop 不认可 → 撤销；明显 Normal 的候选直接按掉
+            label, confidence, src_tag, _crop_proposed = self._maybe_crop_proposal(
+                track, frame, frame_id, label, confidence, src_tag, base_label, base_confidence)
+            if _crop_proposed:
+                source = "rule_engine"  # 提案按规则候选处理：继续走 VLM 确认门
+            label, confidence, src_tag = self._apply_crop_review(
+                track, frame, frame_id, label, confidence, src_tag, base_label, base_confidence)
+
             # 显示层兜底：未确认的规则候选（rule_pending）不进入告警，但应以候选标签展示，
             # 避免"人已倒地、画面还是绿框 Normal"。仅影响可视化，不影响告警口径。
             display_label, display_conf, display_pending = "", 0.0, False
@@ -1216,6 +1503,15 @@ class InferenceEngine:
             if label in self.force_vlm_classes and source == "rule_engine":
                 rule_candidate_conf = float(confidence)
                 rule_label = label  # 规则候选标签：后面 label 会被重置为 base_label，确认窗口必须用原值
+                # 强几何 H03（P1-5）：倒地只有几秒，不能等 VLM 再告警；
+                # 但并行送审，迟到的否决在后续帧生效（veto 锁存），兼顾时延与纠错。
+                strong_geom = (
+                    rule_label == "H03"
+                    and "fall_geometry_rule" in rule_tags
+                    and self.behavior_reasoner.is_strong_fall_geometry(
+                        track.get("bbox", [0, 0, 0, 0]), frame.shape[:2], keypoints)
+                )
+                geom_strong = strong_geom and self.geom_strong_parallel_review
                 skey = self._spatial_key(track.get("bbox", [0, 0, 0, 0]))
                 veto_map = {**self._vlm_veto_spatial.get(skey, {}),
                              **self._vlm_veto.get(track_id, {})}
@@ -1224,16 +1520,23 @@ class InferenceEngine:
                     # 锁存期内：VLM 近期已否决该类 → 压制规则输出
                     label, confidence = base_label, base_confidence
                     src_tag = "vlm_veto"
-                elif cached is not None and (frame_id - cached[0]) < self.force_vlm_throttle_frames:
+                elif cached is not None and (frame_id - cached[0]) < self._veto_cache_frames:
                     if cached[1] != label:
-                        # 复核缓存近期否决 → 登记锁存并压制
-                        veto_frames = int(self._vlm_veto_seconds * max(1.0, self._source_fps))
-                        self._vlm_veto.setdefault(track_id, {})[label] = frame_id + veto_frames
-                        label, confidence = base_label, base_confidence
-                        src_tag = "vlm_veto"
-                    # cached[1] == label → 复核已确认，放行
+                        # 复核缓存近期否决 → 登记锁存并压制。
+                        # 强几何 H03 例外：需要两次"不同缓存结论"同向否决，避免单次误判压掉真跌倒。
+                        if self._geom_veto_allowed(track_id, int(cached[0]), strong_geom):
+                            veto_frames = int(self._vlm_veto_seconds * max(1.0, self._source_fps))
+                            self._vlm_veto.setdefault(track_id, {})[label] = frame_id + veto_frames
+                            label, confidence = base_label, base_confidence
+                            src_tag = "vlm_veto"
+                    else:
+                        # 复核确认 → 清空强几何否决计数
+                        self._geom_veto_last_cache.pop(track_id, None)
+                        self._geom_veto_streak.pop(track_id, None)
                 else:
                     # 提交规则触发的复核（claimed = 规则标签，复用 person-crop 通道）
+                    if strong_geom:
+                        self._geom_strong_reviews += 1
                     self._submit_async_vlm_review(track, frame, frame_id, label, confidence,
                                                   context=self._build_review_context(track_id))
                 # 双钥匙 A：确认窗口按"当前类别"取 track 与空间键的 max（任一有效即放行，抗 ID 切换与判定抖动）
@@ -1242,15 +1545,11 @@ class InferenceEngine:
                 spatial_conf_key = (skey, rule_label)
                 confirmed_until = max(int(self._vlm_confirmed.get(conf_key, 0)),
                                       int(self._vlm_confirmed_spatial.get(spatial_conf_key, 0)))
-                # 强几何 H03 不等待 VLM：复核往返 10s 以上，倒地过程只有几秒，
-                # 等确认=永远错过告警（实测首段跌倒 480~700 全程 rule_pending）。
-                geom_strong = (
-                    rule_label == "H03"
-                    and "fall_geometry_rule" in rule_tags
-                    and self.behavior_reasoner.is_strong_fall_geometry(
-                        track.get("bbox", [0, 0, 0, 0]), frame.shape[:2], keypoints)
-                )
-                if frame_id > confirmed_until and not geom_strong:
+                # geom_strong 已在上面计算：强几何 H03 不等待 VLM（倒地过程只有几秒），
+                # 但仍会走下面的异步送审；迟到的否决用 veto 锁存纠正后续帧。
+                # crop_confirmed：本地 2D 分类器已确认（confirm_alerts 开启时）→ 不等 VLM
+                _crop_key_ok = str(src_tag).startswith("crop_confirmed")
+                if frame_id > confirmed_until and not geom_strong and not _crop_key_ok:
                     recent = hist[-3:]
                     if sum(1 for x in recent if x == rule_label) >= 2:
                         hold = int(self._vlm_confirm_hold_seconds * max(1.0, self._source_fps))
@@ -1329,7 +1628,8 @@ class InferenceEngine:
             )
             # ── VLM 发现器：事件触发 + 周期采样（异步，不阻塞主循环） ──
             try:
-                self._maybe_submit_discovery(track, frame, frame_id, label, confidence, src_tag)
+                self._maybe_submit_discovery(track, frame, frame_id, label, confidence, src_tag,
+                                              tracks=tracks)
             except Exception:
                 pass
 
@@ -1402,6 +1702,10 @@ class InferenceEngine:
         for track_id in stale_ids:
             self.pose_cache.pop(track_id, None)
             self.pose_last_bbox.pop(track_id, None)
+            self._crop_review_cache.pop(track_id, None)
+            self._crop_proposal_hits.pop(track_id, None)
+            self._geom_veto_last_cache.pop(track_id, None)
+            self._geom_veto_streak.pop(track_id, None)
             self.pose_last_frame.pop(track_id, None)
         stale_action_ids = [track_id for track_id in self.action_cache if track_id not in current_track_ids]
         for track_id in stale_action_ids:
@@ -1600,6 +1904,8 @@ class InferenceEngine:
                     "adjudicator": self.alert_adjudicator.status(),
                     "nl_rule_engine": self.nl_rule_engine.status(),
                     "vlm_discovery": self.vlm_discovery.status(),
+                    "crop_classifier": self.crop_classifier.status(),
+                    "geom_strong_reviews": self._geom_strong_reviews,
                     "novel_memo": self.novel_behavior_memo.status(),
                     "prototypes": self.behavior_prototypes.status(),
                     "clip_export": self.clip_exporter.status(),

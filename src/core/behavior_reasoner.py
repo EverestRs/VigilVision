@@ -170,7 +170,6 @@ class BehaviorReasoner:
     def _mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
-    @staticmethod
     def update_zones(self, forbidden_zones: list[dict] | None = None,
                      danger_zones: list[dict] | None = None) -> None:
         """热更新布控区域（REST API 保存后调用，立即生效无需重启）。"""
@@ -1332,6 +1331,7 @@ class BehaviorReasoner:
         # PC 对"跌倒过程"不敏感（32 帧窗口被站立稀释），且 PC=Normal 时不会触发
         # 强制复核 —— 这是"绿框 + VLM 场景理解说有人倒下"的根因。
         # 几何先验产生 H03 候选，复用已有的规则源强制复核（VLM 确认/否决 + 否决锁存）。
+        h03_active = False
         if self.enable_fall_geometry_rule:
             fall_like = self._is_fall_like(bbox, frame_shape, keypoints)
             fall_memory_match = False
@@ -1363,6 +1363,32 @@ class BehaviorReasoner:
             if (fall_like or fall_memory_match) and fall_transition \
                     and self.track_fall_counter[track_id] >= max(3, self.fall_min_frames // 2):
                 rule_candidates.append(("H03", max(0.78, self.default_rule_conf), "fall_geometry_rule"))
+            h03_active = bool(fall_like or fall_memory_match)
+            self.track_h03_mode_hold_counter[track_id] = max(
+                0, int(self.track_h03_mode_hold_counter.get(track_id, 0)) - 1)
+
+        # ── H04 轻生/高危（从 infer() 移植）──
+        # infer() 的完整 risk-then-fall 状态机依赖 11 类决策链，先移植可独立验证的两支：
+        #   ① 危险区入侵（danger_zones 由布控 UI 配置，为空则不触发）
+        #   ② 边缘冲击（贴边 + 躺卧/低姿态几何，且当前非 H03 活跃）
+        # 候选仍走引擎的 VLM 确认门；未确认只在显示层以 H04 红框呈现，不告警。
+        if self._is_intrusion(center, self.danger_zones):
+            rule_candidates.append(("H04", max(0.80, self.default_rule_conf), "danger_zone_rule"))
+        # 运动门限：贴边坐姿/伏案在几何上与"边缘冲击"同构，必须伴随明显运动才算冲击
+        # （负样本实测：无门限时办公片段 900 track 帧里 45 帧误报 H04）
+        impact_motion_ok = motion_level >= self.h04_edge_impact_motion_ratio
+        if (not h03_active) and impact_motion_ok and self._is_danger_like(
+                track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level):
+            self.track_impact_counter[track_id] += 1
+        else:
+            self.track_impact_counter[track_id] = max(0, self.track_impact_counter[track_id] - 1)
+        if self.track_impact_counter[track_id] >= self.h04_impact_min_frames:
+            rule_candidates.append(("H04", max(0.78, self.default_rule_conf), "impact_risk_rule"))
+
+        # ── H05 破坏设施（从 infer() 移植）：持续剧烈运动 ──
+        # 纯运动判据误报风险高（快走/挥手），默认阈值偏保守；先接入并在负样本上标定。
+        if self._is_vandal_like(track_id, bbox, keypoints, motion_ratio=motion_level):
+            rule_candidates.append(("H05", max(0.76, self.default_rule_conf), "vandal_motion_rule"))
 
         # ── H01/H02 双人交互规则（主路径补齐）：打架/霸凌不再"识别对了也无规则产出" ──
         # 候选仍需 VLM 确认（engine 双钥匙门）才会告警，误报由确认/否决机制兜底。

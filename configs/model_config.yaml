@@ -63,6 +63,26 @@ action:
   pose_classifier_conf_high: 0.75
   pose_classifier_conf_low: 0.40
 
+# 2D crop 分类器（M01/M02/H03 本地确认钥匙）
+# 模型来自 results/crop_dataset/best.pth（mobilenet_v3_small，7 类，验证集 92.4%）
+crop_classifier:
+  enabled: true
+  onnx_path: models/crop_classifier/crop_classifier.onnx
+  labels_path: models/crop_classifier/labels.json
+  thresholds_path: models/crop_classifier/thresholds.json
+  input_size: 224
+  device: cpu                 # 小模型跑 CPU，避免与 ONNX 检测抢 GPU
+  classes: [M01, M02, H03]    # 只对这些类做本地确认/否决
+  throttle_frames: 30         # 同 track 两次推理最小间隔（约 2.5s@12fps）
+  normal_conf: 0.85           # 判 Normal 并否决所需置信度
+  confirm_alerts: false       # true=本地确认即可作为告警钥匙；默认只做否决
+  # M01 主提案：Step 2 人工核对精度仅 2/24（办公 0/12、吸烟 2/12），
+  # 当前 crop 模型不跨域（训练裁剪图 vs 真实监控视角），暂关闭，待按监控域重训后再开。
+  propose_m01: false
+  proposal_conf: 0.70
+  proposal_hits: 2
+  m01_require_crop: false     # 同理关闭门控：会误杀真吸烟规则候选
+
 temporal_adjudicator:
   enabled: false
   apply_decision: false
@@ -179,11 +199,11 @@ behavior_heuristics:
   h03_mode_hold_frames: 10
   fall_narrow_aspect_ratio: 0.72
   smoke_min_frames: 6
-  smoke_hand_mouth_ratio: 0.16
+  smoke_hand_mouth_ratio: 0.30   # 与 behavior_rules.json 对齐：0.16 时近嘴帧过多，滞回把多段合并成超长段 → M01 事件恒为 0
   smoke_unilateral_ratio: 1.8
   smoke_head_y_tolerance_ratio: 0.18
   smoke_hand_shoulder_offset_ratio: 0.22
-  smoke_leave_ratio: 0.18
+  smoke_leave_ratio: 0.33
   smoke_event_min_frames: 8
   smoke_event_max_frames: 24
   smoke_rest_min_frames: 12

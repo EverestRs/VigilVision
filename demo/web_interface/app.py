@@ -454,6 +454,15 @@ def render_health(api_base: str, task_id: str | None) -> None:
                 if missing_names:
                     st.caption("预检缺失: " + "、".join(missing_names) + "（缺失项会走回退逻辑）")
 
+        zones_dbg = health.get("zones_debug") or {}
+        if isinstance(zones_dbg, dict) and zones_dbg:
+            if not zones_dbg.get("danger_ready", True):
+                st.warning("⚠️ 危险区未配置：H04（疑似轻生）在结构上无法触发。"
+                           "请到「🎯 布控区域」用 danger 类型绘制至少一个多边形。")
+            else:
+                st.caption(f"布控区域：禁区 {zones_dbg.get('forbidden_count', 0)} 个 · "
+                           f"危险区 {zones_dbg.get('danger_count', 0)} 个")
+
         st.markdown("**模型加载**")
         det_dbg = health.get("detector_debug") or {}
         pose_dbg = health.get("pose_debug") or {}
@@ -1875,6 +1884,10 @@ with left:
         st.subheader("已有布控区域")
         try:
             zones_resp = requests.get(f"{api_base}/api/v1/zones", timeout=10).json()
+            danger_ready = any(len(z.get("polygon") or []) >= 3
+                               for z in zones_resp.get("danger_zones", []))
+            if not danger_ready:
+                st.warning("⚠️ 未配置危险区（danger）：H04（疑似轻生）检测将无法触发。")
             for ztype, zlist in zones_resp.items():
                 for z in zlist:
                     zid = z.get("id", "")

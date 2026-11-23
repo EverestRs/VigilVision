@@ -286,6 +286,9 @@ class NLAlertRuleEngine:
         s = str(source).lower()
         if s.startswith("rule"):
             return not s.startswith("rule_pending")
+        # crop_confirmed：本地 crop 分类器确认（仅当 crop_classifier.confirm_alerts=true）
+        if s.startswith("crop_confirmed"):
+            return True
         return s.startswith("vlm_confirmed") or s in {"vlm_async", "vlm_cache"}
 
     def match_closed(self, track_label: str, confidence: float, frame_id: int,

@@ -76,9 +76,27 @@ def _estimate_task_replay_history_size(config: dict, duration_seconds: int) -> i
     estimated = int(duration_seconds * max_fps / push_stride) + 16
     return int(max(base_buffer, min(5000, estimated)))
 
+def _apply_zones_from_config(target_engine: "InferenceEngine") -> None:
+    """启动/重建引擎时从 camera_config 加载布控区域。
+
+    此前区域只在"保存/删除"接口里热更新，重启后丢失；而 S02/H04 完全依赖这份配置，
+    导致默认部署下 S02 永远不可能触发。
+    """
+    try:
+        cfg = load_yaml(str(CONFIG_DIR / "camera_config.yaml")) or {}
+        zones = cfg.get("zones", {}) if isinstance(cfg, dict) else {}
+        target_engine.behavior_reasoner.update_zones(
+            forbidden_zones=zones.get("forbidden_zones", []),
+            danger_zones=zones.get("danger_zones", []),
+        )
+    except Exception:
+        pass
+
+
 app = FastAPI(title="Campus Security Agent API", version="0.1.0")
 manager = ConnectionManager(history_size=_resolve_replay_buffer_frames(model_cfg))
 engine = InferenceEngine(model_cfg=model_cfg, vlm_cfg=vlm_cfg, output_dir=str(BASE_DIR / "results"))
+_apply_zones_from_config(engine)
 TASKS: dict[str, dict] = {}
 EVAL_JOBS: dict[str, dict] = {}
 TRAIN_JOBS: dict[str, dict] = {"_active": {"running": False, "train_id": ""}}
@@ -99,6 +117,7 @@ def reconfigure_profile(profile_name: str) -> dict:
     manager.set_history_size(_resolve_replay_buffer_frames(model_cfg))
     old_engine = engine
     engine = InferenceEngine(model_cfg=model_cfg, vlm_cfg=vlm_cfg, output_dir=str(BASE_DIR / "results"))
+    _apply_zones_from_config(engine)
     old_engine.close()
     return {
         "profile": active_profile,
@@ -867,6 +886,8 @@ def health_check():
         "detector_debug": engine.detector.get_debug_info(),
         "pose_debug": engine.pose_estimator.get_debug_info(),
         "action_debug": engine.action_recognizer.get_debug_info(),
+        "crop_classifier_debug": engine.crop_classifier.status(),
+        "zones_debug": _zones_summary(),
     }
 
 
@@ -1105,6 +1126,29 @@ class ZoneCreateRequest(BaseModel):
 
 def _read_camera_config() -> dict:
     return load_yaml(str(CONFIG_DIR / "camera_config.yaml")) or {}
+
+
+def _zones_summary() -> dict:
+    """布控区域配置体检（P1-6）：danger_zones 为空时 H04 轻生检测结构上不可达。"""
+    try:
+        cfg = _read_camera_config()
+        zones = cfg.get("zones", {}) if isinstance(cfg, dict) else {}
+
+        def _valid(items) -> list:
+            return [z for z in (items or [])
+                    if isinstance(z, dict) and len(z.get("polygon") or []) >= 3]
+
+        forbidden = _valid(zones.get("forbidden_zones", []))
+        danger = _valid(zones.get("danger_zones", []))
+        return {
+            "forbidden_count": len(forbidden),
+            "danger_count": len(danger),
+            "forbidden_ready": len(forbidden) > 0,
+            "danger_ready": len(danger) > 0,
+            "note": "" if danger else "danger_zones 未配置：H04（疑似轻生）无法触发",
+        }
+    except Exception as exc:
+        return {"error": str(exc)[:120], "forbidden_ready": False, "danger_ready": False}
 
 
 def _save_camera_config(cfg: dict) -> None:

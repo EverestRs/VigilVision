@@ -86,18 +86,49 @@ force_vlm_review:
   classes: [H03, M01, M02]  # 跌倒易与坐姿混淆；吸烟/手机需看清手部动作，均强制大模型复核
   throttle_frames: 75   # 同一目标两次复核的最小间隔（处理帧数）≈6s@12fps；25 时实测 28 次/分钟会把检测吞吐压低 ~30%
   max_per_minute: 8     # 全局复核预算（令牌桶）；VLM 与 ONNX 共用 GPU，超过会拖慢检测导致画面框滞后
+  veto_cache_frames: 300  # 复核结论的有效期（≈25s）：VLM 单次往返常超过 75 帧，
+                          # 用 75 会把迟到的否决当成过期丢弃（强几何 H03 永远无法被否决）
+  geom_strong_parallel_review: true  # 强几何 H03 立即告警的同时并行送 VLM，迟到否决可回撤后续帧
 
 # ── 自然语言告警规则引擎：一句话定义告警（闭集映射 + 开放词汇判定）──
 discovery:
   enabled: true                 # VLM 发现器：事件触发 + 周期采样（异步，不覆盖主判定）
   periodic_interval_sec: 90     # 每个 track 至少每 90s 送审一次（覆盖"无触发但确实有事"）
   per_track_cooldown_sec: 30    # 同一 track 两次送审最小间隔
-  budget_per_hour: 240          # 全局调用预算（令牌桶）；0 表示不限（仅调试）
-  burst: 4                      # 令牌桶容量（允许短时突发）
+  budget_per_hour: 600          # 全局调用预算（令牌桶）；M01 双窗需要连续 2 次，240 会把第二次卡掉
+  burst: 8                      # 令牌桶容量（允许短时突发）
   max_inflight: 2               # 同时进行的发现调用上限（与复核共享 GPU，过高会拖慢检测）
   min_track_age_frames: 24      # 新 track 先稳定 ~2s 再送审
   min_track_score: 0.35         # 目标置信度下限
   low_conf_threshold: 0.40      # PC 低置信触发阈值
+  # M01 专用通道：仅人物裁剪 + 定向 prompt + 双窗时序一致性
+  # 实测依据：pano+crop+通用 prompt 在四种分辨率下 0/5；crop-only+定向 prompt 3/5；两帧 5/5（负样本 1/4）
+  m01_enabled: true
+  m01_image_max_px: 1024        # 人物裁剪目标边长（小目标会放大，但注意力集中在人）
+  m01_cooldown_sec: 2.5         # 必须 >= 双窗间隔，否则第二次会落在 too_soon
+  m01_window_gap_sec: 2.0       # 两个时间窗的最小间隔（视频时间）
+  m01_confirm_cooldown_sec: 30  # 确认后进入长冷却，避免同一段反复确认
+  m01_require_dual_window: true # false=单窗即确认（仅调试）
+  # M02 手机通道：与 M01 同构（裁剪-only + 定向 prompt + 双窗）
+  m02_enabled: true
+  m02_image_max_px: 1024
+  m02_cooldown_sec: 2.5
+  m02_window_gap_sec: 2.0
+  m02_confirm_cooldown_sec: 30
+  m02_require_dual_window: true
+  # H 类通道：H01/H02 双人（pair 聚合 + 2-of-3 投票）；H03/H04/H05 单人/场景（全景+裁剪 + 2-of-3）
+  h_pair_enabled: true
+  h_pair_image_max_px: 1024
+  h_pair_cooldown_sec: 4.0
+  h_pair_confirm_cooldown_sec: 20
+  h_pair_vote_window_sec: 10
+  h_pair_vote_min_hits: 2
+  h_single_enabled: true
+  h_single_image_max_px: 1024
+  h_single_cooldown_sec: 4.0
+  h_single_confirm_cooldown_sec: 20
+  h_single_vote_window_sec: 10
+  h_single_vote_min_hits: 2
   record_path: results/discovery/discovery_events.jsonl
 
 nl_rule_engine:

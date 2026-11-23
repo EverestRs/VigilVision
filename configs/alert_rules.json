@@ -60,10 +60,10 @@
       },
       "stats": {
         "evaluated": 0,
-        "triggered": 859,
-        "last_triggered_frame": 1718,
-        "last_triggered_at": "2026-11-22 15:10:28",
-        "last_triggered_ts": 1795331428.6456325
+        "triggered": 875,
+        "last_triggered_frame": 1178,
+        "last_triggered_at": "2026-11-22 22:37:17",
+        "last_triggered_ts": 1795358237.1830592
       }
     },
     {
