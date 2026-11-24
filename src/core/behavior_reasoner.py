@@ -41,6 +41,13 @@ class BehaviorReasoner:
         self.fall_pose_flat_ratio = float(config.get("fall_pose_flat_ratio", 0.72))
         self.fall_floor_margin_ratio = float(config.get("fall_floor_margin_ratio", 0.12))
         self.fall_center_low_ratio = float(config.get("fall_center_low_ratio", 0.60))
+        # 机位地面线（归一化 y）：躺地判定里的"贴地"不应写死 0.90H，
+        # 因为不同机位地面在画面中的高度不同（Le2i 咖啡间地面在中部，躺地 bottom≈0.84H）。
+        # 由 camera_config.yaml 的 floor_line_ratio 标定，默认 0.90 保持原行为。
+        self.fall_floor_line_ratio = float(config.get("fall_floor_line_ratio", 0.90))
+        # 地面多边形（归一化坐标 0–1）：比单条水平线更贴合透视地面；
+        # 为空时回退到 floor_line_ratio。由布控页“地面多边形”标定。
+        self.fall_floor_polygon: list[list[float]] = []
         self.fall_still_motion_ratio = float(config.get("fall_still_motion_ratio", 0.08))
         self.fall_head_low_ratio = float(config.get("fall_head_low_ratio", 0.58))
         self.fall_event_ttl_calls = int(max(8, config.get("fall_event_ttl_calls", 24)))
@@ -217,12 +224,48 @@ class BehaviorReasoner:
         return sum(values) / len(values) if values else 0.0
 
     def update_zones(self, forbidden_zones: list[dict] | None = None,
-                     danger_zones: list[dict] | None = None) -> None:
-        """热更新布控区域（REST API 保存后调用，立即生效无需重启）。"""
+                     danger_zones: list[dict] | None = None,
+                     floor_line_ratio: float | None = None,
+                     floor_polygon: list[list[float]] | None = None) -> None:
+        """热更新布控区域、地面线与地面多边形（REST API 保存后调用）。"""
         if forbidden_zones is not None:
             self.forbidden_zones = list(forbidden_zones)
         if danger_zones is not None:
             self.danger_zones = list(danger_zones)
+        if floor_line_ratio is not None:
+            self.fall_floor_line_ratio = float(min(0.99, max(0.40, floor_line_ratio)))
+        if floor_polygon is not None:
+            self.fall_floor_polygon = [
+                [float(min(1.0, max(0.0, p[0]))), float(min(1.0, max(0.0, p[1])))]
+                for p in floor_polygon if isinstance(p, (list, tuple)) and len(p) >= 2
+            ]
+
+    @staticmethod
+    def _point_in_polygon(nx: float, ny: float, polygon: list[list[float]]) -> bool:
+        """射线法：归一化坐标点是否在多边形内。"""
+        inside = False
+        count = len(polygon)
+        for i in range(count):
+            x1, y1 = polygon[i][0], polygon[i][1]
+            x2, y2 = polygon[(i + 1) % count][0], polygon[(i + 1) % count][1]
+            if (y1 > ny) != (y2 > ny):
+                cross = (x2 - x1) * (ny - y1) / max(1e-9, (y2 - y1)) + x1
+                if nx < cross:
+                    inside = not inside
+        return inside
+
+    def _bottom_on_floor(self, bbox: list[float], frame_shape: tuple[int, int]) -> bool:
+        """目标框底边是否落在地面区域内（多边形优先，其次地面线）。"""
+        frame_h, frame_w = frame_shape
+        x, y, w, h = [float(v) for v in bbox]
+        if len(self.fall_floor_polygon) >= 3:
+            for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+                nx = (x + w * t) / max(1.0, frame_w)
+                ny = (y + h) / max(1.0, frame_h)
+                if self._point_in_polygon(nx, ny, self.fall_floor_polygon):
+                    return True
+            return False
+        return (y + h) >= frame_h * self.fall_floor_line_ratio
 
     @staticmethod
     def _is_intrusion(center: tuple[float, float], zones: list[dict]) -> bool:
@@ -601,7 +644,8 @@ class BehaviorReasoner:
         x, y, w, h = [float(v) for v in bbox]
         cx, cy = self._bbox_center_xy(bbox)
         bottom = y + h
-        near_floor = bottom >= frame_h * (1.0 - self.fall_floor_margin_ratio) or cy >= frame_h * self.fall_center_low_ratio
+        on_floor = self._bottom_on_floor(bbox, frame_shape)
+        near_floor = on_floor or cy >= frame_h * self.fall_center_low_ratio
         if not near_floor:
             return False
         aspect = w / max(1.0, h)
@@ -611,10 +655,10 @@ class BehaviorReasoner:
         # ① 侧视/俯视躺姿：框明显宽于高 + 贴地（站立/就坐不可能如此宽）。
         # 阈值 1.10 而不是 0.85：smoking 视频里"弯腰探身"的框 aspect 0.85~1.00、
         # 躯干同样水平（torso 0.54~0.70），0.85 起判会把弯腰当躺地（实测误报 5 次告警）。
-        if aspect >= 1.10 and bottom >= frame_h * 0.90:
+        if aspect >= 1.10 and on_floor:
             return True
         # ② 脚端视角躺姿（本项目 laying 机位）：窄高框 + 贴地 + 中心低 + 躯干水平
-        if aspect <= 0.78 and cy >= frame_h * 0.66 and bottom >= frame_h * 0.90 and horizontal_pose:
+        if aspect <= 0.78 and cy >= frame_h * 0.66 and on_floor and horizontal_pose:
             return True
         # ③ 姿态失效兜底：极窄（≤0.72）+ 极低中心 + 几乎完全贴地。
         # 用 0.72 而不是 0.80：smoking 视频里弯腰探身的人 aspect≈0.80、cy≈0.75、

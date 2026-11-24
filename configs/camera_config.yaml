@@ -1,5 +1,20 @@
+cameras: {}
 default_camera:
   camera_id: cam_default_01
+  floor_line_ratio: 0.9
+  floor_polygon:
+  - - 1.0
+    - 1.0
+  - - 0.0
+    - 1.0
+  - - 0.0
+    - 0.9
+  - - 0.1085
+    - 0.7424
+  - - 0.7439
+    - 0.788
+  - - 1.0
+    - 0.9
   fps: 25
   resolution: 1920x1080
   stream_url: data/demo_video.mp4
