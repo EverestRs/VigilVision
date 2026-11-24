@@ -6,7 +6,7 @@
 
 - `preflight_check.py`：检查模型与标签路径是否存在。
 - `export_detector_onnx.ps1`：从 `.pt` 自动导出检测 ONNX，并重命名到项目目标路径。
-- `export_action_onnx.py`：从 `models/action/slowfast.pth` 导出 SlowFast ONNX，并打印输入输出签名。
+- `export_action_onnx.py`：从 SlowFast pth 导出 ONNX（pth 已清理，需从官方仓库下载后通过 `--pth` 指定）。
 - `evaluate_action_mapping.py`：评估“400类→项目8类”临时映射质量，输出统计报告 JSON。
 - `compare_mapping_reports.py`：对比两份映射评估报告（baseline vs candidate），输出差异摘要。
 - `smoke_test_scene_modules.py`：场景理解三模块（叙述器/裁决器/检索）端到端冒烟测试，需先启动 vLLM 服务。
@@ -18,7 +18,7 @@
 conda run -n VdAnalyst python tools/preflight_check.py --profile realtime
 conda run -n VdAnalyst python tools/preflight_check.py --profile high_accuracy
 powershell -ExecutionPolicy Bypass -File tools/export_detector_onnx.ps1
-conda run -n VdAnalyst python tools/export_action_onnx.py --pth models/action/slowfast.pth --onnx models/action/slowfast.onnx --height 224 --width 224 --opset 18
+conda run -n VdAnalyst python tools/export_action_onnx.py --pth <slowfast.pth> --onnx models/action/slowfast.onnx --height 224 --width 224 --opset 18
 conda run -n VdAnalyst python tools/evaluate_action_mapping.py --max-files 300 --output results/mapping_eval_report.json
 conda run -n VdAnalyst python tools/compare_mapping_reports.py --baseline results/mapping_eval_report_recent12.json --candidate results/mapping_eval_report_clip16.json --output results/mapping_eval_comparison.json
 ```

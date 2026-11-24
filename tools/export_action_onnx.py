@@ -46,7 +46,7 @@ def variant_name(slow_t: int, fast_t: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export SlowFast .pth model to ONNX")
-    parser.add_argument("--pth", default="models/action/slowfast.pth", help="input .pth file path")
+    parser.add_argument("--pth", default="", help="input .pth file path（slowfast.pth 已清理，需自备）")
     parser.add_argument("--onnx", default="models/action/slowfast.onnx", help="output .onnx file path")
     parser.add_argument("--height", type=int, default=224, help="input height")
     parser.add_argument("--width", type=int, default=224, help="input width")

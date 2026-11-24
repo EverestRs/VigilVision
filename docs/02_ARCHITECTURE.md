@@ -628,7 +628,7 @@ vLLM / llama-server (:8001)             # 本地大模型
 models/
 ├── detector/  yolov8n.pt / .onnx / _int8.onnx（边缘 .om）
 ├── pose/      vitpose_wholebody_{s,b}.pth / .onnx / _s_int8.onnx
-├── action/    slowfast.pth / .onnx / _int8.onnx
+├── action/    slowfast.onnx / _int8.onnx（slowfast.pth 已清理）
 ├── action_v2/ pose_classifier_best.pth + pose_classifier.onnx（生产）
 ├── crop/      crop_v1.onnx（可选：服务器侧 M01 确认钥匙；当前需按监控域重训）
 ├── embedding/ bge-small-zh-v1.5

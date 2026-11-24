@@ -27,7 +27,7 @@
 
 - `models/detector/yolov8x.onnx`
 - `models/detector/yolov8n_int8.onnx` (realtime 档位可选)
-- `models/pose/vitpose_wholebody_s.onnx` (realtime)
+- `models/pose/vitpose_wholebody_s_int8.onnx` (realtime)
 - `models/pose/vitpose_wholebody_b.onnx` (high_accuracy)
 - `models/action/slowfast.onnx`
 - `models/action/slowfast_int8.onnx` (realtime 档位可选)
@@ -38,7 +38,8 @@
 - `src/core/action_recognizer.py` 已支持基于目标框裁剪的视频片段输入（SlowFast ONNX）。
 - 支持单输入或双输入（slow/fast pathway）ONNX；双输入时会按输入名包含 `slow` 自动走慢路径采样。
 - 若动作 ONNX 不存在或输入签名不匹配，将自动回退到模拟输出，并在 `metrics.action_debug.error` 中给出原因。
-- 当前通过 `tools/export_action_onnx.py` 从 `models/action/slowfast.pth` 导出的模型签名为：
+- `models/action/slowfast.pth` 已清理（SlowFast 已禁用）；如需重新导出，请从官方仓库下载 pth 后运行 `tools/export_action_onnx.py --pth <path>`。
+- 当前通过 `tools/export_action_onnx.py` 从 SlowFast pth 导出的模型签名为：
 	- `slow_pathway: [batch, 3, 8, 224, 224]`
 	- `fast_pathway: [batch, 3, 32, 224, 224]`
 	- `logits: [batch, 400]`

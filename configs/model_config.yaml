@@ -31,7 +31,8 @@ pose:
   keypoint_keep_indices: []
 action:
   name: slowfast
-  model_path: models/action/slowfast.pth
+  # 源 pth 已清理（SlowFast 已禁用，运行时只用 ONNX）；需要重导出时从官方仓库下载
+  model_path: ""
   onnx_path: models/action/slowfast.onnx
   labels_path: configs/labels/action_labels.txt
   direct_classes:               # ROADMAP Stage 3：原型扩展类（须与部署 ONNX 输出维度一致）

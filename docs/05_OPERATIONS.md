@@ -61,7 +61,7 @@ pip install torch torchvision transformers jieba rank_bm25 onnx
 
 - **YOLOv8n**：Ultralytics 官方 `.pt` → `tools/export_detector_onnx.ps1`（Windows）或 ONNX 导出脚本；INT8 量化另行导出；
 - **ViTPose**：官方权重 → ONNX 导出（`tools/export_pose_int8_onnx.py` 量化）；
-- **SlowFast**：`models/action/slowfast.pth` → `tools/export_action_onnx.py`（签名：`slow_pathway [b,3,8,224,224]`、`fast_pathway [b,3,32,224,224]`、`logits [b,400]`）；
+- **SlowFast**：`models/action/slowfast.pth` 已清理（运行时只用 ONNX）；如需重导出，从官方仓库下载 pth 后执行 `tools/export_action_onnx.py --pth <path>`（签名：`slow_pathway [b,3,8,224,224]`、`fast_pathway [b,3,32,224,224]`、`logits [b,400]`）；
 - **PoseClassifier**：`train.py` 训练后自动导出（产物含 `train_metrics.json`）；
 - ~~Crop / 边缘 OM 导出~~：`train_crop_classifier.py`、`export_om_atlas.sh` 已随边缘代码移除。
 

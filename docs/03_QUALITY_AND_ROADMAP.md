@@ -191,7 +191,7 @@
 | B5/B6 死变量 | 重构残留 | 删除 |
 | TemporalAdjudicator "白烧计算"表述 | 复核确认 `enabled=false` 时快速返回 | 表述更正，保留禁用裁决 |
 
-另记录：约 780MB 过期模型文件（`pose_classifier_epoch10~50.pth` 等）待归档删除；约 20 处低危 pyflakes 项待清扫。
+模型资产（2026-11-24）：已清理约 **443MB** 过期/冗余权重——embedding 的 `pytorch_model.bin`（92M，safetensors 已验证可替代）、无引用的 `vitpose_wholebody_s.onnx`（97M）、训练中间产物 `pose_classifier_final.pth`（107M）、已禁用 SlowFast 的 `slowfast.pth`（133M）；`pose_classifier_best.pth` 保留用于 ONNX 重导出。此前文档记录的“约 780MB（`pose_classifier_epoch10~50.pth`）”在当前工作区已不存在，属历史遗留描述。约 20 处低危 pyflakes 项仍待清扫。
 
 ### 3.6 未见行为链路的根因修复（2026-09-27，重要）
 
@@ -252,7 +252,7 @@
 | 视频切片 | 未实现（仅截图 + JSON） |
 | API 安全 | 无认证/加密/脱敏 |
 | 边缘性能 | 盒上 1.82fps 未达 2fps 线；OM 加载受 pyACL 约定阻塞（见 04） |
-| 模型资产 | 约 780MB 过期权重待清理 |
+| 模型资产 | 已清理约 443MB 过期/冗余权重（2026-11-24）；保留 best.pth/ONNX 用于重导出 |
 
 ---
 
