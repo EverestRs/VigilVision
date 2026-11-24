@@ -1000,6 +1000,7 @@ def render_overlay_component(
     <video id=\"nativeVideo\" src=\"\" controls autoplay muted playsinline style=\"width:100%;height:auto;display:block;\"></video>
     <canvas id=\"overlayCanvas\" style=\"position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;\"></canvas>
     <div id=\"diagBanner\" style=\"display:none;position:absolute;top:34px;left:10px;right:10px;z-index:9;\"></div>
+    <div id=\"taskBanner\" style=\"display:none;position:absolute;top:8px;left:10px;right:120px;z-index:12;\"></div>
     <button id=\"floatBtn\" style=\"position:absolute;top:8px;right:8px;z-index:10;display:none;background:rgba(31,78,121,0.92);color:#fff;border:none;border-radius:6px;padding:5px 10px;font:12px/1.4 sans-serif;cursor:pointer;\">🧷 悬浮窗口</button>
   </div>
 {stats_panel_markup}
@@ -1028,6 +1029,19 @@ def render_overlay_component(
     const debugMode = {debug_mode_json};
         const initialTaskStatus = {task_status_json};
         const initialTaskError = {task_error_json};
+        const taskBanner = document.getElementById('taskBanner');
+        function showTaskBanner(text, color) {{
+            try {{
+                taskBanner.style.display = 'block';
+                taskBanner.innerHTML = '<div style="background:' + (color || 'rgba(202,0,0,0.92)')
+                    + ';color:#fff;padding:6px 10px;border-radius:6px;font:12px/1.5 sans-serif;">'
+                    + text + '</div>';
+            }} catch (e) {{}}
+        }}
+        if (!['running', 'queued', 'pending'].includes(String(initialTaskStatus).toLowerCase())) {{
+            showTaskBanner('⚠ 任务已结束（' + initialTaskStatus + '）：画面会停在最后一帧，框不会继续更新。'
+                + '请回到侧边栏重新开始分析。');
+        }}
         const initialStreamStats = {stream_stats_json};
     const statsSpecs = {stats_specs_json};
   const video = document.getElementById('nativeVideo');
@@ -1255,6 +1269,10 @@ def render_overlay_component(
         const syncedEvent = eventPair.a;
         const nextEvent = eventPair.b;
         const interpT = eventPair.t;
+        // 结果缓冲已落后于视频（任务结束/卡住）→ 不再画最后一批框
+        const newestFid = eventBuffer.length ? Number(eventBuffer[eventBuffer.length - 1].frame_id || 0) : 0;
+        const currentFid = Math.floor((video.currentTime || 0) * getTimelineFps()) + 1;
+        const staleResult = newestFid > 0 && currentFid > newestFid + 12;
         latestEvent = syncedEvent;
         const frameIdForRender = syncedEvent && syncedEvent.frame_id ? syncedEvent.frame_id : '-';
         const renderKey = `${{video.currentTime.toFixed(3)}}|${{frameIdForRender}}|${{video.paused}}`;
@@ -1263,7 +1281,7 @@ def render_overlay_component(
             lastRenderedKey = renderKey;
         }}
 
-        if (syncedEvent && Array.isArray(syncedEvent.detections)) {{
+        if (syncedEvent && !staleResult && Array.isArray(syncedEvent.detections)) {{
             const dets = syncedEvent.detections;
             const streaming = syncedEvent.metrics && syncedEvent.metrics.streaming ? syncedEvent.metrics.streaming : {{}};
       const inputSize = Array.isArray(streaming.input_size) ? streaming.input_size : [];
@@ -1323,6 +1341,14 @@ def render_overlay_component(
         const alertName = LABEL_CN[alertKey] || (alertKey === 'NL_RULE_HIT' ? '规则命中' : (rawAlertType || '未知'));
         ctx.fillText(`ALERT: ${{alertName}}`, 14, 27);
       }}
+    }}
+
+    if (staleResult) {{
+        ctx.fillStyle = 'rgba(202,0,0,0.85)';
+        ctx.fillRect(8, 8, 360, 26);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText('⚠ 无实时结果（任务可能已结束）', 14, 26);
     }}
 
     const now = performance.now();
@@ -1476,6 +1502,10 @@ def render_overlay_component(
         }}
         userPaused = false;
         syncEnabled = false;   // 用户手动播放：自动同步从此不再干预
+    }});
+    video.addEventListener('ended', () => {{
+        showTaskBanner('▶ 视频已播放到结尾：任务可能已结束，框不会再更新。请重新开始分析。',
+                       'rgba(31,78,121,0.92)');
     }});
 
   window.addEventListener('resize', resizeCanvas);
@@ -1788,6 +1818,30 @@ with left:
             except Exception:
                 pass
 
+            status_text = str(task_snapshot.get("status", "unknown")) if isinstance(task_snapshot, dict) else "unknown"
+            if status_text in ("finished", "failed", "stopped", "not_found"):
+                st.warning(f"任务状态：{status_text}。画面会停在最后结果，框不会继续更新。")
+                if st.button("🔄 重新开始同一视频", key="restart_same_video"):
+                    try:
+                        restart = requests.post(
+                            f"{api_base}/api/v1/analyze/stream",
+                            json={"stream_url": get_current_stream_url(),
+                                  "duration": int(st.session_state.get("task_duration", 0) or 0),
+                                  "callback_url": None},
+                            timeout=10,
+                        )
+                        if restart.ok:
+                            new_id = restart.json().get("task_id")
+                            st.session_state["task_id"] = new_id
+                            st.session_state["pending_task_id"] = new_id
+                            st.session_state["pending_stream_url"] = get_current_stream_url()
+                            st.session_state["task_stopped"] = False
+                            st.rerun()
+                        else:
+                            st.error(f"重新开始失败: {restart.text[:180]}")
+                    except Exception as exc:
+                        st.error(f"重新开始异常: {exc}")
+
             ws_url = build_ws_url(api_base, active_task_id)
             render_overlay_component(
                 media_url=media_url,
@@ -1863,21 +1917,40 @@ with left:
                 st.rerun()
 
             zone_name = st.text_input("区域名称", value="", placeholder="例如: 左侧禁区", key="zone_name_input")
-            zone_type = st.selectbox("区域类型", ["forbidden", "danger"],
-                                     format_func=lambda x: "禁区（S02 闯入）" if x == "forbidden" else "危险区（H04 靠近）",
-                                     key="zone_type_sel")
-            if st.button("💾 保存区域", use_container_width=True) and len(zone_points) >= 3 and zone_name.strip():
-                resp = requests.post(f"{api_base}/api/v1/zones", json={
-                    "name": zone_name.strip(),
-                    "zone_type": zone_type,
-                    "polygon": zone_points,
-                }, timeout=10)
-                if resp.ok:
-                    st.success(f"✅ 区域已保存并生效: {resp.json().get('zone_id')}")
-                    st.session_state["zone_points"] = []
-                    st.session_state.pop("zone_frame", None)
+            zone_type = st.selectbox(
+                "区域类型", ["forbidden", "danger", "floor"],
+                format_func=lambda x: {"forbidden": "禁区（S02 闯入）",
+                                       "danger": "危险区（H04 靠近）",
+                                       "floor": "地面多边形（H03 跌倒标定）"}[x],
+                key="zone_type_sel")
+            if st.button("💾 保存区域", use_container_width=True) and len(zone_points) >= 3:
+                if zone_type == "floor":
+                    zf = st.session_state.get("zone_frame")
+                    fh, fw = (zf.shape[:2] if zf is not None else (1080, 1920))
+                    pts = [[round(min(1.0, max(0.0, px)) / fw, 4),
+                            round(min(1.0, max(0.0, py)) / fh, 4)] for px, py in zone_points]
+                    resp = requests.post(f"{api_base}/api/v1/camera/floor-polygon",
+                                         json={"points": pts}, timeout=10)
+                    if resp.ok:
+                        st.success(f"✅ 地面多边形已保存并生效（{len(pts)} 顶点）")
+                        st.session_state["zone_points"] = []
+                        st.session_state.pop("zone_frame", None)
+                    else:
+                        st.error(f"保存失败: {resp.text[:150]}")
+                elif zone_name.strip():
+                    resp = requests.post(f"{api_base}/api/v1/zones", json={
+                        "name": zone_name.strip(),
+                        "zone_type": zone_type,
+                        "polygon": zone_points,
+                    }, timeout=10)
+                    if resp.ok:
+                        st.success(f"✅ 区域已保存并生效: {resp.json().get('zone_id')}")
+                        st.session_state["zone_points"] = []
+                        st.session_state.pop("zone_frame", None)
+                    else:
+                        st.error(f"保存失败: {resp.text[:150]}")
                 else:
-                    st.error(f"保存失败: {resp.text[:150]}")
+                    st.warning("请填写区域名称")
             elif len(zone_points) < 3:
                 st.caption("至少需要 3 个顶点")
 
@@ -1899,8 +1972,122 @@ with left:
                         st.rerun()
             if not any(zones_resp.values()):
                 st.info("暂无布控区域。截取帧面后画多边形保存。")
+            try:
+                fp = requests.get(f"{api_base}/api/v1/camera/floor-polygon", timeout=8).json()
+                n_floor = len(fp.get("points") or [])
+                st.caption(f"地面多边形：{n_floor} 个顶点"
+                           + ("（已启用，优先于地面线）" if n_floor >= 3 else "（未配置，回退地面线）"))
+                if n_floor >= 3 and st.button("🗑️ 清除地面多边形", key="clear_floor_poly"):
+                    requests.post(f"{api_base}/api/v1/camera/floor-polygon",
+                                  json={"points": []}, timeout=10)
+                    st.rerun()
+            except Exception:
+                pass
         except Exception as exc:
             st.caption(f"读取区域失败: {exc}")
+
+        st.subheader("🤖 自动标定地面多边形（可选）")
+        auto_video = st.text_input(
+            "标定视频路径或 RTSP 地址",
+            value=st.session_state.get("auto_floor_video", "../data/laying_corner_1-1.mp4"),
+            key="auto_floor_video",
+            help="文件路径（相对项目根/绝对）或 rtsp:// / rtmp:// / http(s):// 流地址。"
+                 "建议用一段有人走动/跌倒的片段，30–120s。",
+        )
+        ac1, ac2, ac3 = st.columns(3)
+        auto_frames = ac1.number_input("采样帧数", min_value=30, max_value=300,
+                                       value=int(st.session_state.get("auto_floor_frames", 120)),
+                                       step=10, key="auto_floor_frames")
+        auto_sec = ac2.number_input("采样间隔(秒)", min_value=0.5, max_value=5.0,
+                                    value=float(st.session_state.get("auto_floor_sec", 1.0)),
+                                    step=0.5, key="auto_floor_sec")
+        auto_duration = ac3.number_input("流时长上限(秒)", min_value=5, max_value=600,
+                                         value=int(st.session_state.get("auto_floor_duration", 30)),
+                                         step=5, key="auto_floor_duration")
+        if st.button("🚀 开始自动标定", use_container_width=True, key="auto_floor_start"):
+            try:
+                is_stream = auto_video.strip().lower().startswith(
+                    ("rtsp://", "rtmp://", "http://", "https://"))
+                payload = {
+                    "max_frames": int(auto_frames),
+                    "sample_sec": float(auto_sec),
+                    "duration_sec": float(auto_duration),
+                    "apply": True,
+                }
+                restart_target = (st.session_state.get("task_id")
+                                  or st.session_state.get("pending_task_id"))
+                if restart_target:
+                    payload["restart_task_id"] = restart_target
+                if is_stream:
+                    payload["rtsp_url"] = auto_video.strip()
+                else:
+                    payload["video_path"] = auto_video.strip()
+                resp = requests.post(
+                    f"{api_base}/api/v1/camera/floor-polygon/auto",
+                    json=payload, timeout=15,
+                )
+                if not resp.ok:
+                    st.error(f"启动失败: {resp.text[:180]}")
+                else:
+                    job_id = resp.json().get("job_id")
+                    progress = st.progress(0.0)
+                    status_line = st.empty()
+                    import time as _time
+                    job = {}
+                    for _ in range(180):
+                        _time.sleep(1.0)
+                        job = requests.get(
+                            f"{api_base}/api/v1/camera/floor-polygon/auto/{job_id}",
+                            timeout=8).json()
+                        total = max(1, int(job.get("total") or 1))
+                        done = int(job.get("frames") or 0)
+                        progress.progress(min(1.0, done / total))
+                        status_line.caption(
+                            f"状态 {job.get('status')} · 已采样 {done}/{total}")
+                        if job.get("status") in ("done", "failed"):
+                            break
+                    if job.get("status") == "done":
+                        result = job.get("result") or {}
+                        restarted = result.get("restarted_task_id")
+                        if restarted:
+                            # 标定成功后自动重启原任务：绑定新任务，回到可视化继续看框
+                            st.session_state["task_id"] = restarted
+                            st.session_state["pending_task_id"] = restarted
+                            st.session_state["pending_stream_url"] = st.session_state.get(
+                                "stream_url_input", "")
+                            st.session_state["task_stopped"] = False
+                        st.success(f"✅ 自动标定完成：{result.get('polygon_points', 0)} 顶点"
+                                   f"（{result.get('result', '')}）"
+                                   + (f"；已自动重启任务 {restarted}" if restarted else ""))
+                        st.json({"polygon": result.get("polygon"),
+                                 "foot_points": result.get("foot_points"),
+                                 "suggested_floor_line_ratio": result.get("suggested_floor_line_ratio"),
+                                 "restarted_task_id": restarted})
+                        st.rerun()
+                    else:
+                        st.error(f"标定失败: {job.get('error', '超时或未知错误')}")
+            except Exception as exc:
+                st.error(f"自动标定异常: {exc}")
+
+        st.subheader("📐 机位地面线标定（地面多边形未配置时生效）")
+        try:
+            fl = requests.get(f"{api_base}/api/v1/camera/floor-line", timeout=8).json()
+            cur_ratio = float(fl.get("ratio", 0.90))
+        except Exception:
+            cur_ratio = 0.90
+        ratio = st.slider(
+            "地面线位置（画面高度比例）", 0.50, 0.99,
+            value=min(0.99, max(0.50, cur_ratio)), step=0.01,
+            help="躺地判定“贴地”的参考线：目标框底边应不低于此线。"
+                 "本项目 laying 机位约 0.90；Le2i 咖啡间约 0.80–0.85。",
+        )
+        if st.button("💾 保存地面线", use_container_width=True):
+            resp = requests.post(f"{api_base}/api/v1/camera/floor-line",
+                                 json={"ratio": ratio}, timeout=10)
+            if resp.ok:
+                st.success(f"✅ 地面线已保存并生效: {resp.json().get('ratio')}")
+            else:
+                st.error(f"保存失败: {resp.text[:150]}")
 
     else:
         st.info("已停止可视化。点击下方按钮恢复上次视图。")

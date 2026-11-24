@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from src.api.websocket_server import ConnectionManager
 from src.core.scene_index import SceneIndex
+from src.pipeline.engine_pool import EnginePool
 from src.pipeline.inference_engine import InferenceEngine
 from src.pipeline.video_stream import VideoStream
 from src.utils.config_loader import load_json, load_yaml
@@ -76,27 +77,70 @@ def _estimate_task_replay_history_size(config: dict, duration_seconds: int) -> i
     estimated = int(duration_seconds * max_fps / push_stride) + 16
     return int(max(base_buffer, min(5000, estimated)))
 
-def _apply_zones_from_config(target_engine: "InferenceEngine") -> None:
-    """启动/重建引擎时从 camera_config 加载布控区域。
+def _camera_record(cfg: dict, camera_id: str, create: bool = False) -> dict | None:
+    """取相机配置记录；default/默认相机沿用旧结构（default_camera + zones）。"""
+    if not isinstance(cfg, dict):
+        return None
+    legacy = cfg.get("default_camera", {}) or {}
+    if not camera_id or camera_id == "default" or camera_id == legacy.get("camera_id"):
+        return cfg
+    cams = cfg.setdefault("cameras", {}) if create else (cfg.get("cameras") or {})
+    if camera_id in cams:
+        return cams[camera_id]
+    if not create:
+        return None
+    cams[camera_id] = {
+        "camera_id": camera_id,
+        "stream_url": legacy.get("stream_url", ""),
+        "zones": {"forbidden_zones": [], "danger_zones": []},
+        "floor_line_ratio": float(legacy.get("floor_line_ratio", 0.90)),
+        "floor_polygon": list(legacy.get("floor_polygon") or []),
+    }
+    return cams[camera_id]
 
-    此前区域只在"保存/删除"接口里热更新，重启后丢失；而 S02/H04 完全依赖这份配置，
-    导致默认部署下 S02 永远不可能触发。
-    """
+
+def _zones_for(cfg: dict, camera_id: str = "default") -> dict:
+    record = _camera_record(cfg, camera_id)
+    if record is cfg:
+        return cfg.get("zones", {}) or {}
+    return (record or {}).get("zones", {}) or {}
+
+
+def _floor_cfg_for(cfg: dict, camera_id: str = "default") -> dict:
+    record = _camera_record(cfg, camera_id)
+    if record is cfg:
+        return cfg.get("default_camera", {}) or {}
+    return record or {}
+
+
+def _apply_zones_from_config(target_engine: "InferenceEngine", camera_id: str = "default") -> None:
+    """启动/重建引擎时从 camera_config 加载该相机的布控区域与地面标定。"""
     try:
         cfg = load_yaml(str(CONFIG_DIR / "camera_config.yaml")) or {}
-        zones = cfg.get("zones", {}) if isinstance(cfg, dict) else {}
+        zones = _zones_for(cfg, camera_id)
+        floor = _floor_cfg_for(cfg, camera_id)
         target_engine.behavior_reasoner.update_zones(
             forbidden_zones=zones.get("forbidden_zones", []),
             danger_zones=zones.get("danger_zones", []),
+            floor_line_ratio=float(floor.get("floor_line_ratio", 0.90)),
+            floor_polygon=floor.get("floor_polygon", []),
         )
     except Exception:
         pass
 
 
+def _create_engine_for_camera(camera_id: str) -> InferenceEngine:
+    eng = InferenceEngine(model_cfg=model_cfg, vlm_cfg=vlm_cfg,
+                          output_dir=str(BASE_DIR / "results"))
+    _apply_zones_from_config(eng, camera_id)
+    return eng
+
+
 app = FastAPI(title="Campus Security Agent API", version="0.1.0")
 manager = ConnectionManager(history_size=_resolve_replay_buffer_frames(model_cfg))
-engine = InferenceEngine(model_cfg=model_cfg, vlm_cfg=vlm_cfg, output_dir=str(BASE_DIR / "results"))
-_apply_zones_from_config(engine)
+_engine_pool_max = int((model_cfg.get("runtime", {}) or {}).get("max_engines", 2))
+engine_pool = EnginePool(_create_engine_for_camera, max_engines=_engine_pool_max)
+engine = engine_pool.get("default")
 TASKS: dict[str, dict] = {}
 EVAL_JOBS: dict[str, dict] = {}
 TRAIN_JOBS: dict[str, dict] = {"_active": {"running": False, "train_id": ""}}
@@ -116,8 +160,13 @@ def reconfigure_profile(profile_name: str) -> dict:
     model_cfg, active_profile, active_model_paths = apply_inference_profile(raw_model_cfg, profile_name=profile_name)
     manager.set_history_size(_resolve_replay_buffer_frames(model_cfg))
     old_engine = engine
+    # 档位是全局模型配置：关闭其它相机引擎，避免同池混用两套权重
+    for _cid in list(engine_pool.status().get("cameras", [])):
+        if _cid != "default":
+            engine_pool.close(_cid)
     engine = InferenceEngine(model_cfg=model_cfg, vlm_cfg=vlm_cfg, output_dir=str(BASE_DIR / "results"))
-    _apply_zones_from_config(engine)
+    _apply_zones_from_config(engine, "default")
+    engine_pool.set("default", engine)
     old_engine.close()
     return {
         "profile": active_profile,
@@ -341,7 +390,14 @@ def run_render_task(task_id: str, stream_url: str) -> None:
             TASKS[task_id]["error"] = f"video_writer: {writer_error}"
 
 
-async def run_task(task_id: str, stream_url: str, duration: int):
+async def run_task(task_id: str, stream_url: str, duration: int, camera_id: str = "default"):
+    # 本函数内所有 engine.* 都指向该相机自己的引擎；单路默认仍复用 default
+    try:
+        task_engine = engine_pool.get(camera_id)
+    except RuntimeError as exc:
+        TASKS.setdefault(task_id, {}).update(status="failed", error=str(exc)[:200])
+        return
+    engine = task_engine
     inference_cfg = model_cfg.get("inference", {})
     # T2.2: 解码三档（cv/ffmpeg/auto）——g2 探针实测选档后写入档位；失败回退默认 cv
     try:
@@ -888,6 +944,7 @@ def health_check():
         "action_debug": engine.action_recognizer.get_debug_info(),
         "crop_classifier_debug": engine.crop_classifier.status(),
         "zones_debug": _zones_summary(),
+        "engine_pool": engine_pool.status(),
     }
 
 
@@ -940,14 +997,22 @@ async def analyze_stream(request: AnalyzeStreamRequest):
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     replay_history_size = _estimate_task_replay_history_size(model_cfg, int(request.duration))
     manager.prepare_task(task_id, history_size=replay_history_size)
+    camera_id = str(getattr(request, "camera_id", "default") or "default")
+    if not engine_pool.can_accept(camera_id):
+        raise HTTPException(
+            status_code=429,
+            detail=f"引擎池已满（{engine_pool.status()['count']}/{engine_pool.max_engines}），"
+                   f"无法为相机 {camera_id} 创建新引擎；请先停止其它相机任务或调大 max_engines")
     TASKS[task_id] = {
         "status": "queued",
         "stream_url": request.stream_url,
+        "duration": int(request.duration or 0),
+        "camera_id": camera_id,
         "last_frame": 0,
         "stop_requested": False,
         "eval_dump": bool(getattr(request, "eval_dump", False)),
     }
-    asyncio.create_task(run_task(task_id, request.stream_url, request.duration))
+    asyncio.create_task(run_task(task_id, request.stream_url, request.duration, camera_id))
     return AnalyzeStreamResponse(
         task_id=task_id,
         status="running",
@@ -1124,6 +1189,34 @@ class ZoneCreateRequest(BaseModel):
     polygon: list[list[float]]  # [[x1,y1],[x2,y2],...]
 
 
+class FloorLineRequest(BaseModel):
+    ratio: float  # 归一化 y（0.40–0.99）
+
+
+class FloorPolygonRequest(BaseModel):
+    points: list[list[float]]  # 归一化 [[x,y],...]
+
+
+class FloorAutoRequest(BaseModel):
+    video_path: str | None = None      # 文件路径（缺省用 camera_config.stream_url）
+    rtsp_url: str | None = None        # rtsp:// / rtmp:// / http(s):// 流地址
+    source_type: str = "auto"          # auto | file | stream
+    duration_sec: float | None = 30.0  # 仅流模式：最长采样时长
+    sample_sec: float = 1.0
+    max_frames: int = 120
+    floor_line: float | None = None    # 缺省用相机配置
+    apply: bool = True
+    restart_task_id: str | None = None  # 标定成功后自动重启该任务（沿用 stream_url/duration）
+    camera_id: str = "default"          # 多相机：标定结果写入该相机配置
+
+
+# 自动标定后台任务（内存态，重启即清空）
+CALIB_JOBS: dict[str, dict] = {}
+_CALIB_LOCK = threading.Lock()
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+TASK_RESTART_LOCK = threading.Lock()
+
+
 def _read_camera_config() -> dict:
     return load_yaml(str(CONFIG_DIR / "camera_config.yaml")) or {}
 
@@ -1145,6 +1238,8 @@ def _zones_summary() -> dict:
             "danger_count": len(danger),
             "forbidden_ready": len(forbidden) > 0,
             "danger_ready": len(danger) > 0,
+            "floor_line_ratio": float((cfg.get("default_camera") or {}).get("floor_line_ratio", 0.90)),
+            "floor_polygon_points": len((cfg.get("default_camera") or {}).get("floor_polygon") or []),
             "note": "" if danger else "danger_zones 未配置：H04（疑似轻生）无法触发",
         }
     except Exception as exc:
@@ -1156,58 +1251,331 @@ def _save_camera_config(cfg: dict) -> None:
         _yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
 
 
-def _hot_reload_zones() -> None:
-    """保存后热更新引擎内的布控区域，无需重启。"""
+def _hot_reload_zones(camera_id: str = "default") -> None:
+    """保存后热更新对应相机引擎的布控区域/地面标定，无需重启。"""
     cfg = _read_camera_config()
-    zones = cfg.get("zones", {})
-    engine.behavior_reasoner.update_zones(
+    zones = _zones_for(cfg, camera_id)
+    floor = _floor_cfg_for(cfg, camera_id)
+    target = engine_pool.get_if_exists(camera_id) if camera_id != "default" else engine
+    if target is None:
+        return
+    target.behavior_reasoner.update_zones(
         forbidden_zones=zones.get("forbidden_zones", []),
         danger_zones=zones.get("danger_zones", []),
+        floor_line_ratio=float(floor.get("floor_line_ratio", 0.90)),
+        floor_polygon=floor.get("floor_polygon", []),
     )
 
 
-@app.get("/api/v1/zones")
-def get_zones():
+@app.get("/api/v1/cameras")
+def list_cameras():
+    """多相机接口：返回配置中的相机与当前引擎池占用情况。"""
     cfg = _read_camera_config()
-    zones = cfg.get("zones", {})
+    legacy = cfg.get("default_camera", {}) or {}
+    items = [{
+        "camera_id": legacy.get("camera_id", "cam_default_01"),
+        "stream_url": legacy.get("stream_url", ""),
+        "zones": cfg.get("zones", {}) or {},
+        "floor_line_ratio": legacy.get("floor_line_ratio", 0.90),
+    }]
+    for cid, entry in (cfg.get("cameras") or {}).items():
+        items.append({
+            "camera_id": cid,
+            "stream_url": entry.get("stream_url", ""),
+            "zones": entry.get("zones", {}) or {},
+            "floor_line_ratio": entry.get("floor_line_ratio", 0.90),
+        })
+    return {"cameras": items, "pool": engine_pool.status()}
+
+
+@app.delete("/api/v1/cameras/{camera_id}")
+def close_camera(camera_id: str):
+    """关闭指定相机的引擎以释放显存（default 引擎不可关闭）。"""
+    legacy_id = (_read_camera_config().get("default_camera", {}) or {}).get("camera_id", "cam_default_01")
+    if camera_id in ("default", legacy_id):
+        raise HTTPException(status_code=400, detail="默认相机引擎不可关闭")
+    if engine_pool.get_if_exists(camera_id) is None:
+        raise HTTPException(status_code=404, detail=f"相机未启动: {camera_id}")
+    engine_pool.close(camera_id)
+    return {"status": "closed", "camera_id": camera_id, "pool": engine_pool.status()}
+
+
+@app.get("/api/v1/zones")
+def get_zones(camera_id: str = Query("default")):
+    cfg = _read_camera_config()
+    zones = _zones_for(cfg, camera_id)
     return {
+        "camera_id": camera_id,
         "forbidden_zones": zones.get("forbidden_zones", []),
         "danger_zones": zones.get("danger_zones", []),
     }
 
 
 @app.post("/api/v1/zones")
-def create_zone(request: ZoneCreateRequest):
+def create_zone(request: ZoneCreateRequest, camera_id: str = Query("default")):
     if request.zone_type not in ("forbidden", "danger"):
         raise HTTPException(status_code=400, detail="zone_type 必须是 forbidden 或 danger")
     if len(request.polygon) < 3:
         raise HTTPException(status_code=400, detail="多边形至少需要 3 个顶点")
     cfg = _read_camera_config()
-    if "zones" not in cfg:
-        cfg["zones"] = {}
+    record = _camera_record(cfg, camera_id, create=True)
+    zones = cfg.setdefault("zones", {}) if record is cfg else record.setdefault("zones", {})
     key = f"{request.zone_type}_zones"
-    if key not in cfg["zones"]:
-        cfg["zones"][key] = []
+    zones.setdefault(key, [])
     zone_id = f"zone_{request.zone_type}_{int(time.time())}"
-    cfg["zones"][key].append({"id": zone_id, "polygon": request.polygon})
+    zones[key].append({"id": zone_id, "polygon": request.polygon})
     _save_camera_config(cfg)
-    _hot_reload_zones()
-    return {"status": "created", "zone_id": zone_id, "zone_type": request.zone_type, "polygon": request.polygon}
+    _hot_reload_zones(camera_id)
+    return {"status": "created", "camera_id": camera_id, "zone_id": zone_id,
+            "zone_type": request.zone_type, "polygon": request.polygon}
+
+
+@app.get("/api/v1/camera/floor-line")
+def get_floor_line(camera_id: str = Query("default")):
+    cfg = _read_camera_config()
+    floor = _floor_cfg_for(cfg, camera_id)
+    return {"camera_id": camera_id, "ratio": float(floor.get("floor_line_ratio", 0.90))}
+
+
+@app.post("/api/v1/camera/floor-line")
+def set_floor_line(request: FloorLineRequest, camera_id: str = Query("default")):
+    if not 0.40 <= float(request.ratio) <= 0.99:
+        raise HTTPException(status_code=400, detail="ratio 必须在 0.40–0.99 之间")
+    cfg = _read_camera_config()
+    record = _camera_record(cfg, camera_id, create=True)
+    target = cfg.setdefault("default_camera", {}) if record is cfg else record
+    target["floor_line_ratio"] = round(float(request.ratio), 3)
+    _save_camera_config(cfg)
+    _hot_reload_zones(camera_id)
+    return {"ok": True, "camera_id": camera_id, "ratio": target["floor_line_ratio"]}
+
+
+@app.get("/api/v1/camera/floor-polygon")
+def get_floor_polygon(camera_id: str = Query("default")):
+    cfg = _read_camera_config()
+    floor = _floor_cfg_for(cfg, camera_id)
+    return {"camera_id": camera_id, "points": floor.get("floor_polygon") or []}
+
+
+@app.post("/api/v1/camera/floor-polygon")
+def set_floor_polygon(request: FloorPolygonRequest, camera_id: str = Query("default")):
+    points = request.points or []
+    # 空列表 = 清除标定，回退地面线
+    if points and len(points) < 3:
+        raise HTTPException(status_code=400, detail="地面多边形至少需要 3 个顶点")
+    normalized = []
+    for p in points:
+        if len(p) < 2:
+            raise HTTPException(status_code=400, detail="顶点格式必须是 [x, y]")
+        nx, ny = float(p[0]), float(p[1])
+        if not (0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0):
+            raise HTTPException(status_code=400, detail="顶点必须是归一化坐标 0–1")
+        normalized.append([round(nx, 4), round(ny, 4)])
+    cfg = _read_camera_config()
+    record = _camera_record(cfg, camera_id, create=True)
+    target = cfg.setdefault("default_camera", {}) if record is cfg else record
+    target["floor_polygon"] = normalized
+    _save_camera_config(cfg)
+    _hot_reload_zones(camera_id)
+    return {"ok": True, "camera_id": camera_id, "points": normalized}
+
+
+async def _restart_task_async(old_task_id: str) -> str | None:
+    """用原任务的 stream_url/duration 创建一个新任务，并停掉旧任务。"""
+    info = TASKS.get(old_task_id)
+    if not isinstance(info, dict):
+        return None
+    stream_url = info.get("stream_url")
+    if not stream_url:
+        return None
+    duration = int(info.get("duration", 0) or 0)
+    camera_id = str(info.get("camera_id", "default") or "default")
+    # 停旧任务（即使已结束也无害）；新任务从视频开头重新分析
+    info["stop_requested"] = True
+    new_id = f"task_{uuid.uuid4().hex[:8]}"
+    replay_history_size = _estimate_task_replay_history_size(model_cfg, duration)
+    manager.prepare_task(new_id, history_size=replay_history_size)
+    TASKS[new_id] = {
+        "status": "queued",
+        "stream_url": stream_url,
+        "duration": duration,
+        "camera_id": camera_id,
+        "last_frame": 0,
+        "stop_requested": False,
+        "eval_dump": False,
+        "restarted_from": old_task_id,
+    }
+    asyncio.create_task(run_task(new_id, stream_url, duration, camera_id))
+    return new_id
+
+
+def _restart_task_sync(old_task_id: str) -> str | None:
+    """工作线程 → 主事件循环的安全桥接。"""
+    loop = _MAIN_LOOP
+    if loop is None or loop.is_closed():
+        return None
+    with TASK_RESTART_LOCK:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_restart_task_async(old_task_id), loop)
+            return fut.result(timeout=15)
+        except Exception:
+            return None
+
+
+def _mask_stream_url(url: str) -> str:
+    """隐藏流地址里的账号密码（rtsp://user:pass@host → rtsp://***@host）。"""
+    import re
+    return re.sub(r"//[^@/]+@", "//***@", str(url))
+
+
+def _run_auto_floor_job(job_id: str, source: str, is_stream: bool,
+                        duration_sec: float | None, sample_sec: float,
+                        max_frames: int, floor_line: float, apply: bool,
+                        restart_task_id: str | None = None) -> None:
+    """后台执行自动地面标定，避免阻塞 API 主线程。"""
+    from src.core.behavior_reasoner import BehaviorReasoner
+    from src.core.detector import Detector
+    from src.core.floor_calibration import calibrate_from_video
+    from src.core.pose_estimator import PoseEstimator
+
+    def _update(**kwargs) -> None:
+        with _CALIB_LOCK:
+            CALIB_JOBS.setdefault(job_id, {}).update(kwargs)
+
+    try:
+        model_cfg = load_yaml(str(CONFIG_DIR / "model_config.yaml")) or {}
+        det = Detector(dict(model_cfg.get("detector", {})))
+        pose = PoseEstimator(dict(model_cfg.get("pose", {})))
+        reasoner = BehaviorReasoner(dict(model_cfg.get("behavior_heuristics", {})))
+
+        def _progress(done: int, total: int) -> None:
+            _update(frames=done, total=total)
+
+        summary = calibrate_from_video(
+            source, det, pose, reasoner,
+            floor_line=floor_line, sample_sec=sample_sec,
+            max_frames=max_frames, progress_cb=_progress,
+            is_stream=is_stream, duration_sec=duration_sec,
+        )
+        if apply and summary.get("polygon"):
+            ccfg = _read_camera_config()
+            record = _camera_record(ccfg, camera_id, create=True)
+            target = ccfg.setdefault("default_camera", {}) if record is ccfg else record
+            target["floor_polygon"] = summary["polygon"]
+            _save_camera_config(ccfg)
+            _hot_reload_zones(camera_id)
+            summary["applied"] = True
+            summary["camera_id"] = camera_id
+            # 标定成功→按原参数自动重启原任务，避免任务在标定期间结束/画面停在最后帧
+            if restart_task_id:
+                restarted = _restart_task_sync(str(restart_task_id))
+                if restarted:
+                    summary["restarted_task_id"] = restarted
+                    summary["restarted_from"] = str(restart_task_id)
+        _update(status="done", result=summary, frames=summary.get("frames_used", 0))
+    except Exception as exc:  # noqa: BLE001
+        # 流地址可能带账号密码，错误信息也必须脱敏
+        _update(status="failed", error=_mask_stream_url(str(exc))[:240])
+    finally:
+        # 标定会额外加载一套检测/姿态模型；显式释放，避免 GPU 显存长期驻留
+        try:
+            del det, pose, reasoner  # noqa: F821
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+
+
+@app.post("/api/v1/camera/floor-polygon/auto")
+async def start_auto_floor(request: FloorAutoRequest):
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+    cfg = _read_camera_config()
+    cam = cfg.get("default_camera", {}) if isinstance(cfg, dict) else {}
+    candidate = (request.rtsp_url or request.video_path or cam.get("stream_url") or "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400,
+                            detail="缺少 video_path/rtsp_url，且相机配置没有 stream_url")
+    lower = candidate.lower()
+    stream_like = lower.startswith(("rtsp://", "rtmp://", "http://", "https://"))
+    if request.source_type == "file" and stream_like:
+        raise HTTPException(status_code=400, detail="source_type=file 但地址是流协议")
+    is_stream = request.source_type == "stream" or (
+        request.source_type == "auto" and stream_like)
+
+    if is_stream:
+        source = candidate
+        description = _mask_stream_url(candidate)
+        duration = request.duration_sec if request.duration_sec is not None else 30.0
+        if not 1.0 <= float(duration) <= 3600.0:
+            raise HTTPException(status_code=400, detail="duration_sec 必须在 1–3600 秒")
+        duration = float(duration)
+    else:
+        video = Path(candidate)
+        if not video.is_absolute():
+            video = (BASE_DIR / video).resolve()
+        if not video.exists() or not video.is_file():
+            raise HTTPException(status_code=404, detail=f"视频不存在: {video}")
+        source = str(video)
+        description = str(video)
+        duration = None
+
+    floor_line = request.floor_line if request.floor_line is not None \
+        else float(cam.get("floor_line_ratio", 0.90))
+    if not 0.40 <= float(floor_line) <= 0.99:
+        raise HTTPException(status_code=400, detail="floor_line 必须在 0.40–0.99")
+
+    job_id = f"floor_{uuid.uuid4().hex[:8]}"
+    with _CALIB_LOCK:
+        CALIB_JOBS[job_id] = {
+            "status": "running", "video": description,
+            "mode": "stream" if is_stream else "file",
+            "frames": 0, "total": int(request.max_frames), "created": time.time(),
+            "restart_task_id": request.restart_task_id,
+            "camera_id": request.camera_id,
+        }
+        if len(CALIB_JOBS) > 20:
+            oldest = sorted(CALIB_JOBS.items(), key=lambda kv: kv[1].get("created", 0))[0][0]
+            CALIB_JOBS.pop(oldest, None)
+    threading.Thread(
+        target=_run_auto_floor_job,
+        args=(job_id, source, is_stream, duration, float(request.sample_sec),
+              int(request.max_frames), float(floor_line), bool(request.apply),
+              request.restart_task_id, request.camera_id),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "running", "mode": "stream" if is_stream else "file"}
+
+
+@app.get("/api/v1/camera/floor-polygon/auto/{job_id}")
+def get_auto_floor(job_id: str):
+    with _CALIB_LOCK:
+        job = CALIB_JOBS.get(job_id)
+        return dict(job) if job else {"status": "not_found"}
 
 
 @app.delete("/api/v1/zones/{zone_id}")
-def delete_zone(zone_id: str):
+def delete_zone(zone_id: str, camera_id: str = Query("default")):
     cfg = _read_camera_config()
-    zones = cfg.get("zones", {})
-    for key in ("forbidden_zones", "danger_zones"):
-        zone_list = zones.get(key, [])
-        before = len(zone_list)
-        zones[key] = [z for z in zone_list if z.get("id") != zone_id]
-        if len(zones[key]) < before:
-            cfg["zones"] = zones
-            _save_camera_config(cfg)
-            _hot_reload_zones()
-            return {"status": "deleted", "zone_id": zone_id}
+    candidates: list[tuple[str, dict]] = [(camera_id, _camera_record(cfg, camera_id))]
+    for cid, record in (cfg.get("cameras") or {}).items():
+        candidates.append((cid, record))
+    seen = set()
+    for cid, record in candidates:
+        if record is None or id(record) in seen:
+            continue
+        seen.add(id(record))
+        zones = cfg.get("zones", {}) if record is cfg else record.get("zones", {})
+        for key in ("forbidden_zones", "danger_zones"):
+            zone_list = zones.get(key, [])
+            before = len(zone_list)
+            zones[key] = [z for z in zone_list if z.get("id") != zone_id]
+            if len(zones[key]) < before:
+                if record is cfg:
+                    cfg["zones"] = zones
+                _save_camera_config(cfg)
+                _hot_reload_zones(cid)
+                return {"status": "deleted", "camera_id": cid, "zone_id": zone_id}
     raise HTTPException(status_code=404, detail=f"zone not found: {zone_id}")
 
 

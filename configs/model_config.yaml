@@ -96,6 +96,7 @@ temporal_adjudicator:
 
 runtime:
   device: cuda
+  max_engines: 2              # 多相机引擎池上限（每引擎占一份模型显存）
   backend: onnxruntime
   execution_provider: CUDAExecutionProvider
   intra_op_num_threads: 4

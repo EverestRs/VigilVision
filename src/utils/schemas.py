@@ -60,6 +60,7 @@ class AnalyzeStreamRequest(BaseModel):
     callback_url: str | None = None
     duration: int = 0
     eval_dump: bool = False  # C5: 逐帧标签落盘（事件级评估用）
+    camera_id: str = "default"  # 多相机预留：同一 camera_id 复用同一引擎
 
 
 class AnalyzeStreamResponse(BaseModel):
