@@ -31,13 +31,14 @@ CONF_TOL = 0.02
 BBOX_TOL = 2.0
 
 
-def run_baseline(frames: int = 200, start: int = 250) -> list[dict]:
+def run_baseline(frames: int = 200, start: int = 250,
+                 video: str = "../data/whole_process_corner_1.mp4") -> list[dict]:
     model_cfg = yaml.safe_load((ROOT / "configs" / "model_config.yaml").read_text(encoding="utf-8"))
     vlm_cfg = yaml.safe_load((ROOT / "configs" / "vlm_config.yaml").read_text(encoding="utf-8"))
     vlm_cfg["use_vllm"] = False  # 确定性：VLM 关，纯主路径（PC→三级决策→SlowFast 回退→规则）
     engine = InferenceEngine(model_cfg, vlm_cfg, output_dir="results/golden_tmp")
     engine.begin_task("golden")
-    cap = cv2.VideoCapture(str(ROOT / "../data/whole_process_corner_1.mp4"))
+    cap = cv2.VideoCapture(str(ROOT / video))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start)  # 跳过空场景头段，从有人活动段起
     records = []
     fid = start
@@ -89,19 +90,23 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["capture", "check"])
     ap.add_argument("--frames", type=int, default=200)
+    ap.add_argument("--start", type=int, default=250)
+    ap.add_argument("--video", default="../data/whole_process_corner_1.mp4")
+    ap.add_argument("--golden", default="results/golden/main_path_corner_1_200.json")
     args = ap.parse_args()
-    records = run_baseline(args.frames)
+    golden = ROOT / args.golden
+    records = run_baseline(args.frames, args.start, args.video)
     if args.mode == "capture":
-        GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        GOLDEN.write_text(json.dumps({"video": "whole_process_corner_1.mp4", "frames": args.frames,
+        golden.parent.mkdir(parents=True, exist_ok=True)
+        golden.write_text(json.dumps({"video": args.video, "frames": args.frames,
                                       "records": records}, ensure_ascii=False, indent=1), encoding="utf-8")
         n_det = sum(len(r["detections"]) for r in records)
-        print(f"golden 基线已写入 {GOLDEN}（{len(records)} 帧 / {n_det} 条检测）")
+        print(f"golden 基线已写入 {golden}（{len(records)} 帧 / {n_det} 条检测）")
         return 0
-    if not GOLDEN.exists():
-        print("golden 基线不存在，先运行 capture")
+    if not golden.exists():
+        print(f"golden 基线不存在: {golden}，先运行 capture")
         return 2
-    base = json.loads(GOLDEN.read_text(encoding="utf-8"))["records"]
+    base = json.loads(golden.read_text(encoding="utf-8"))["records"]
     diffs = compare(base, records)
     if diffs:
         print(f"✗ 回归失败（{len(diffs)} 处差异）:")
