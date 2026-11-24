@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from typing import Any
 
+from src.core.rule_state import StateRegistry, arm, step, tick
+
 
 class BehaviorReasoner:
     def __init__(self, config: dict[str, Any] | None = None):
@@ -134,6 +136,50 @@ class BehaviorReasoner:
         self.track_smoke_state: dict[str, dict[str, Any]] = {}
         self.track_vandal_counter: dict[str, int] = defaultdict(int)
         self.track_danger_counter: dict[str, int] = defaultdict(int)
+
+        # 状态归一：所有 per-track / per-pair 表集中注册，清理只保留一份清单。
+        # 之前每次新增状态都要同时改 clear_stale_tracks，漏改会跨 track 串状态。
+        self._state = StateRegistry()
+        for _table in (
+            self.track_centers,
+            self.track_bboxes,
+            self.track_first_frame_id,
+            self.track_last_center,
+            self.track_last_area,
+            self.track_phone_counter,
+            self.track_tamper_counter,
+            self.track_fall_counter,
+            self.track_fall_transition_frame,
+            self.track_h03_counter,
+            self.track_h02_counter,
+            self.track_h01_counter,
+            self.track_base_h02_counter,
+            self.track_base_h03_counter,
+            self.track_motion_level,
+            self.track_impact_counter,
+            self.track_h04_hold_counter,
+            self.track_h04_transition_counter,
+            self.track_h04_transition_cooldown,
+            self.track_h03_risk_pre_counter,
+            self.track_h03_mode_hold_counter,
+            self.track_h03_mode,
+            self.track_smoke_counter,
+            self.track_smoke_state,
+            self.track_vandal_counter,
+            self.track_danger_counter,
+        ):
+            self._state.track(_table)
+        for _table in (
+            self.pair_h02_counter,
+            self.pair_h01_counter,
+            self.pair_h01_transition_counter,
+            self.pair_contact_counter,
+            self.pair_dual_active_counter,
+            self.pair_last_distance,
+            self.pair_last_frame,
+        ):
+            self._state.pair(_table)
+
         self.reasoner_tick = 0
         self.recent_fall_events: deque[dict[str, float]] = deque(maxlen=96)
 
@@ -793,34 +839,21 @@ class BehaviorReasoner:
                 self.pair_last_distance[pair_key] = distance_now
 
                 contact_like = iou_contact >= self.interaction_contact_iou or approaching
-                if contact_like:
-                    self.pair_contact_counter[pair_key] += 1
-                else:
-                    self.pair_contact_counter[pair_key] = max(0, self.pair_contact_counter[pair_key] - 1)
+                step(self.pair_contact_counter, pair_key, contact_like)
 
                 dual_active = (motion_level >= self.h01_dual_active_ratio
                                and peer_motion >= self.h01_dual_active_ratio)
-                if dual_active:
-                    self.pair_dual_active_counter[pair_key] += 1
-                else:
-                    self.pair_dual_active_counter[pair_key] = max(
-                        0, self.pair_dual_active_counter[pair_key] - 1)
+                step(self.pair_dual_active_counter, pair_key, dual_active)
 
                 h02_like = motion_level >= self.h02_motion_ratio and (limb_activity >= 0.10 or contact_like)
-                if h02_like:
-                    self.pair_h02_counter[pair_key] += 1
-                else:
-                    self.pair_h02_counter[pair_key] = max(0, self.pair_h02_counter[pair_key] - 1)
+                step(self.pair_h02_counter, pair_key, h02_like)
 
                 h01_like = (
                     motion_level >= self.h01_motion_ratio
                     and peer_motion >= self.h01_dual_active_ratio
                     and (limb_activity >= 0.12 or self.pair_contact_counter[pair_key] >= 2)
                 )
-                if h01_like:
-                    self.pair_h01_counter[pair_key] += 1
-                else:
-                    self.pair_h01_counter[pair_key] = max(0, self.pair_h01_counter[pair_key] - 1)
+                step(self.pair_h01_counter, pair_key, h01_like)
 
             if int(self.pair_h02_counter.get(pair_key, 0)) >= self.h02_pair_min_frames:
                 candidates.append(("H02", 0.80, "bully_pair_rule_light"))
@@ -830,10 +863,7 @@ class BehaviorReasoner:
         return candidates
 
     def _is_vandal_like(self, track_id: str, bbox: list[float], keypoints: list[list[float]], motion_ratio: float = 0.0, **kwargs) -> bool:
-        if motion_ratio >= self.vandal_motion_ratio:
-            self.track_vandal_counter[track_id] += 1
-        else:
-            self.track_vandal_counter[track_id] = max(0, self.track_vandal_counter[track_id] - 1)
+        step(self.track_vandal_counter, track_id, motion_ratio >= self.vandal_motion_ratio)
         return self.track_vandal_counter[track_id] >= self.vandal_min_frames
 
     def _is_edge_impact_like(self, track_id: str, bbox: list[float], frame_shape: tuple[int, int], keypoints: list[list[float]], motion_ratio: float = 0.0, limb_activity: float = 0.0) -> bool:
@@ -900,14 +930,8 @@ class BehaviorReasoner:
         motion_level = float(motion_ratio + area_change_ratio * 0.5)
         self.track_motion_level[track_id] = motion_level
 
-        if str(base_label) == "H02":
-            self.track_base_h02_counter[track_id] += 1
-        else:
-            self.track_base_h02_counter[track_id] = max(0, self.track_base_h02_counter[track_id] - 1)
-        if str(base_label) == "H03":
-            self.track_base_h03_counter[track_id] += 1
-        else:
-            self.track_base_h03_counter[track_id] = max(0, self.track_base_h03_counter[track_id] - 1)
+        step(self.track_base_h02_counter, track_id, str(base_label) == "H02")
+        step(self.track_base_h03_counter, track_id, str(base_label) == "H03")
 
         close_peers = self._close_peer_ids(track_id, bbox, peer_tracks)
         peer_active = sum(1 for peer_id in close_peers if float(self.track_motion_level.get(peer_id, 0.0)) >= self.h02_motion_ratio)
@@ -916,15 +940,8 @@ class BehaviorReasoner:
         bully_like = len(close_peers) >= 1 and motion_level >= self.h02_motion_ratio and limb_activity >= 0.16
         fight_like = len(close_peers) >= 1 and peer_active >= 1 and motion_level >= self.h01_motion_ratio and limb_activity >= 0.18
 
-        if bully_like:
-            self.track_h02_counter[track_id] += 1
-        else:
-            self.track_h02_counter[track_id] = max(0, self.track_h02_counter[track_id] - 1)
-
-        if fight_like:
-            self.track_h01_counter[track_id] += 1
-        else:
-            self.track_h01_counter[track_id] = max(0, self.track_h01_counter[track_id] - 1)
+        step(self.track_h02_counter, track_id, bully_like)
+        step(self.track_h01_counter, track_id, fight_like)
 
         if self.track_h02_counter[track_id] >= self.h02_min_frames:
             rule_candidates.append(("H02", max(0.77, self.default_rule_conf), "bully_interaction_rule"))
@@ -1002,16 +1019,10 @@ class BehaviorReasoner:
                 self.pair_last_distance[pair_key] = distance_now
 
             contact_like = iou_contact >= self.interaction_contact_iou or approaching
-            if contact_like:
-                self.pair_contact_counter[pair_key] += 1
-            else:
-                self.pair_contact_counter[pair_key] = max(0, self.pair_contact_counter[pair_key] - 1)
+            step(self.pair_contact_counter, pair_key, contact_like)
 
             dual_active_like = motion_level >= self.h01_dual_active_ratio and peer_motion >= self.h01_dual_active_ratio
-            if dual_active_like:
-                self.pair_dual_active_counter[pair_key] += 1
-            else:
-                self.pair_dual_active_counter[pair_key] = max(0, self.pair_dual_active_counter[pair_key] - 1)
+            step(self.pair_dual_active_counter, pair_key, dual_active_like)
 
             pair_h02_like = (
                 motion_level >= self.h02_motion_ratio
@@ -1023,15 +1034,8 @@ class BehaviorReasoner:
                 and (limb_activity >= 0.12 or self.pair_contact_counter[pair_key] >= 2)
             )
 
-            if pair_h02_like:
-                self.pair_h02_counter[pair_key] += 1
-            else:
-                self.pair_h02_counter[pair_key] = max(0, self.pair_h02_counter[pair_key] - 1)
-
-            if pair_h01_like:
-                self.pair_h01_counter[pair_key] += 1
-            else:
-                self.pair_h01_counter[pair_key] = max(0, self.pair_h01_counter[pair_key] - 1)
+            step(self.pair_h02_counter, pair_key, pair_h02_like)
+            step(self.pair_h01_counter, pair_key, pair_h01_like)
 
             pair_h01_transition_like = (
                 str(base_label) == "H02"
@@ -1040,10 +1044,7 @@ class BehaviorReasoner:
                 and self.pair_contact_counter[pair_key] >= 1
                 and self.pair_dual_active_counter[pair_key] >= 1
             )
-            if pair_h01_transition_like:
-                self.pair_h01_transition_counter[pair_key] += 1
-            else:
-                self.pair_h01_transition_counter[pair_key] = max(0, self.pair_h01_transition_counter[pair_key] - 1)
+            step(self.pair_h01_transition_counter, pair_key, pair_h01_transition_like)
 
             if self.pair_h02_counter[pair_key] >= self.h02_pair_min_frames or (
                 self.pair_contact_counter[pair_key] >= self.h02_pair_min_frames and motion_level >= self.h02_motion_ratio
@@ -1094,18 +1095,15 @@ class BehaviorReasoner:
         fall_like = self._is_fall_like(bbox, frame_shape, keypoints)
         fall_memory_match = False
         if fall_like:
-            self.track_fall_counter[track_id] += 2
+            step(self.track_fall_counter, track_id, True, up=2)
             self._push_fall_event(bbox)
         else:
             if self._fall_posture_candidate(bbox, frame_shape, keypoints) and self._match_recent_fall_event(bbox):
                 fall_memory_match = True
-                self.track_fall_counter[track_id] += 1
+                step(self.track_fall_counter, track_id, True)
             else:
-                self.track_fall_counter[track_id] = max(0, self.track_fall_counter[track_id] - 1)
-        if fall_like or fall_memory_match:
-            self.track_h03_counter[track_id] += 2
-        else:
-            self.track_h03_counter[track_id] = max(0, self.track_h03_counter[track_id] - 1)
+                step(self.track_fall_counter, track_id, False)
+        step(self.track_h03_counter, track_id, fall_like or fall_memory_match, up=2)
 
         h03_continuity = self.track_h03_counter[track_id] >= self.h03_hold_frames
         if h03_continuity and (fall_like or fall_memory_match) and self._fall_posture_candidate(bbox, frame_shape, keypoints):
@@ -1120,12 +1118,11 @@ class BehaviorReasoner:
         h03_active = fall_like or fall_memory_match or self.track_h03_counter[track_id] >= self.h03_hold_frames
 
         edge_impact_like = self._is_edge_impact_like(track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level, limb_activity=limb_activity)
+        step(self.track_impact_counter, track_id, edge_impact_like)
         if edge_impact_like:
-            self.track_impact_counter[track_id] += 1
-            self.track_h04_hold_counter[track_id] = self.h04_pre_fall_hold_frames
+            arm(self.track_h04_hold_counter, track_id, self.h04_pre_fall_hold_frames)
         else:
-            self.track_impact_counter[track_id] = max(0, self.track_impact_counter[track_id] - 1)
-            self.track_h04_hold_counter[track_id] = max(0, self.track_h04_hold_counter[track_id] - 1)
+            tick(self.track_h04_hold_counter, track_id)
 
         if not h03_active and self.track_impact_counter[track_id] >= self.h04_impact_min_frames:
             rule_candidates.append(("H04", max(0.80, self.default_rule_conf), "impact_risk_rule"))
@@ -1139,19 +1136,16 @@ class BehaviorReasoner:
             or edge_impact_like
             or motion_level >= (self.h04_edge_impact_motion_ratio * 1.15)
         )
-        if has_edge_impact_evidence:
-            self.track_h03_risk_pre_counter[track_id] += 1
-        else:
-            self.track_h03_risk_pre_counter[track_id] = max(0, self.track_h03_risk_pre_counter[track_id] - 1)
+        step(self.track_h03_risk_pre_counter, track_id, has_edge_impact_evidence)
 
         if fall_like or fall_memory_match:
             if self.track_h03_risk_pre_counter[track_id] >= self.h03_risk_pre_frames:
                 self.track_h03_mode[track_id] = "risk_then_fall"
             else:
                 self.track_h03_mode[track_id] = "direct_fall"
-            self.track_h03_mode_hold_counter[track_id] = self.h03_mode_hold_frames
+            arm(self.track_h03_mode_hold_counter, track_id, self.h03_mode_hold_frames)
         else:
-            self.track_h03_mode_hold_counter[track_id] = max(0, self.track_h03_mode_hold_counter[track_id] - 1)
+            tick(self.track_h03_mode_hold_counter, track_id)
             if self.track_h03_mode_hold_counter[track_id] <= 0:
                 self.track_h03_mode[track_id] = ""
 
@@ -1163,11 +1157,9 @@ class BehaviorReasoner:
             and has_edge_impact_evidence
             and self.track_h04_transition_cooldown[track_id] <= 0
         )
+        step(self.track_h04_transition_counter, track_id, early_h03_transition)
         if early_h03_transition:
-            self.track_h04_transition_counter[track_id] += 1
             self.track_h04_transition_cooldown[track_id] = self.h04_transition_cooldown_frames
-        else:
-            self.track_h04_transition_counter[track_id] = max(0, self.track_h04_transition_counter[track_id] - 1)
 
         transition_h04_active = self.track_h04_transition_counter[track_id] >= self.h04_transition_min_frames
         if (
@@ -1200,12 +1192,13 @@ class BehaviorReasoner:
 
         if self._is_intrusion(center, self.danger_zones):
             rule_candidates.append(("H04", max(0.80, self.default_rule_conf), "danger_zone_rule"))
-        elif not h03_active and self._is_danger_like(track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level):
-            self.track_danger_counter[track_id] += 1
-            if self.track_danger_counter[track_id] >= max(4, self.fall_min_frames // 2):
-                rule_candidates.append(("H04", max(0.79, self.default_rule_conf), "danger_edge_rule"))
         else:
-            self.track_danger_counter[track_id] = max(0, self.track_danger_counter[track_id] - 1)
+            # 注意：危险区命中时不动计数器（与原实现一致），只在"非危险区"分支做增减
+            danger_hit = (not h03_active) and self._is_danger_like(
+                track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level)
+            step(self.track_danger_counter, track_id, danger_hit)
+            if danger_hit and self.track_danger_counter[track_id] >= max(4, self.fall_min_frames // 2):
+                rule_candidates.append(("H04", max(0.79, self.default_rule_conf), "danger_edge_rule"))
 
         if self._is_vandal_like(track_id, bbox, keypoints, motion_ratio=motion_ratio + area_change_ratio * 0.5):
             rule_candidates.append(("H05", max(0.76, self.default_rule_conf), "vandal_motion_rule"))
@@ -1320,10 +1313,7 @@ class BehaviorReasoner:
             rule_candidates.append(("M01", 0.72, "smoking_posture_rule"))
 
         # ── M02 手机姿态规则（从 infer() 移植） ──
-        if self._head_hand_near(keypoints, bbox):
-            self.track_phone_counter[track_id] = int(self.track_phone_counter.get(track_id, 0)) + 1
-        else:
-            self.track_phone_counter[track_id] = max(0, int(self.track_phone_counter.get(track_id, 0)) - 1)
+        step(self.track_phone_counter, track_id, self._head_hand_near(keypoints, bbox))
         if int(self.track_phone_counter.get(track_id, 0)) >= self.phone_min_frames:
             rule_candidates.append(("M02", max(0.72, self.default_rule_conf), "phone_posture_rule"))
 
@@ -1336,18 +1326,15 @@ class BehaviorReasoner:
             fall_like = self._is_fall_like(bbox, frame_shape, keypoints)
             fall_memory_match = False
             if fall_like:
-                self.track_fall_counter[track_id] += 2
+                step(self.track_fall_counter, track_id, True, up=2)
                 self._push_fall_event(bbox)
             else:
                 if self._fall_posture_candidate(bbox, frame_shape, keypoints) and self._match_recent_fall_event(bbox):
                     fall_memory_match = True
-                    self.track_fall_counter[track_id] += 1
+                    step(self.track_fall_counter, track_id, True)
                 else:
-                    self.track_fall_counter[track_id] = max(0, self.track_fall_counter[track_id] - 1)
-            if fall_like or fall_memory_match:
-                self.track_h03_counter[track_id] += 2
-            else:
-                self.track_h03_counter[track_id] = max(0, self.track_h03_counter[track_id] - 1)
+                    step(self.track_fall_counter, track_id, False)
+            step(self.track_h03_counter, track_id, fall_like or fall_memory_match, up=2)
             # 转变证据：静止就坐/长期蹲坐不报 H03（详见 _fall_transition_evidence 注释）。
             # 命中跌倒事件记忆（附近刚有人倒下）同样算证据——ID 切换后新 track 没有
             # 自己的历史，此时空间记忆是唯一的转变线索。
@@ -1364,8 +1351,7 @@ class BehaviorReasoner:
                     and self.track_fall_counter[track_id] >= max(3, self.fall_min_frames // 2):
                 rule_candidates.append(("H03", max(0.78, self.default_rule_conf), "fall_geometry_rule"))
             h03_active = bool(fall_like or fall_memory_match)
-            self.track_h03_mode_hold_counter[track_id] = max(
-                0, int(self.track_h03_mode_hold_counter.get(track_id, 0)) - 1)
+            tick(self.track_h03_mode_hold_counter, track_id)
 
         # ── H04 轻生/高危（从 infer() 移植）──
         # infer() 的完整 risk-then-fall 状态机依赖 11 类决策链，先移植可独立验证的两支：
@@ -1377,11 +1363,9 @@ class BehaviorReasoner:
         # 运动门限：贴边坐姿/伏案在几何上与"边缘冲击"同构，必须伴随明显运动才算冲击
         # （负样本实测：无门限时办公片段 900 track 帧里 45 帧误报 H04）
         impact_motion_ok = motion_level >= self.h04_edge_impact_motion_ratio
-        if (not h03_active) and impact_motion_ok and self._is_danger_like(
-                track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level):
-            self.track_impact_counter[track_id] += 1
-        else:
-            self.track_impact_counter[track_id] = max(0, self.track_impact_counter[track_id] - 1)
+        impact_hit = (not h03_active) and impact_motion_ok and self._is_danger_like(
+            track_id, bbox, frame_shape, keypoints, motion_ratio=motion_level)
+        step(self.track_impact_counter, track_id, impact_hit)
         if self.track_impact_counter[track_id] >= self.h04_impact_min_frames:
             rule_candidates.append(("H04", max(0.78, self.default_rule_conf), "impact_risk_rule"))
 
@@ -1433,65 +1417,5 @@ class BehaviorReasoner:
         return best_label, round(float(best_conf), 2), source, tags
 
     def clear_stale_tracks(self, active_track_ids: set[str]) -> None:
-        for table in [
-            self.track_centers,
-            self.track_bboxes,
-            self.track_last_center,
-            self.track_last_area,
-            self.track_phone_counter,
-            self.track_tamper_counter,
-            self.track_fall_counter,
-            self.track_fall_transition_frame,
-            self.track_h03_counter,
-            self.track_h02_counter,
-            self.track_h01_counter,
-            self.track_base_h02_counter,
-            self.track_base_h03_counter,
-            self.track_motion_level,
-            self.track_impact_counter,
-            self.track_h04_hold_counter,
-            self.track_h04_transition_counter,
-            self.track_h04_transition_cooldown,
-            self.track_h03_risk_pre_counter,
-            self.track_h03_mode_hold_counter,
-            self.track_h03_mode,
-            self.track_smoke_counter,
-            self.track_smoke_state,
-            self.track_vandal_counter,
-            self.track_danger_counter,
-        ]:
-            stale = [track_id for track_id in table if track_id not in active_track_ids]
-            for track_id in stale:
-                table.pop(track_id, None)
-
-        stale_pairs_h02 = [key for key in self.pair_h02_counter if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_h02:
-            self.pair_h02_counter.pop(key, None)
-
-        stale_pairs_h01 = [key for key in self.pair_h01_counter if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_h01:
-            self.pair_h01_counter.pop(key, None)
-
-        stale_pairs_h01_transition = [key for key in self.pair_h01_transition_counter if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_h01_transition:
-            self.pair_h01_transition_counter.pop(key, None)
-
-        stale_pairs_contact = [key for key in self.pair_contact_counter if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_contact:
-            self.pair_contact_counter.pop(key, None)
-
-        stale_pairs_dual = [key for key in self.pair_dual_active_counter if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_dual:
-            self.pair_dual_active_counter.pop(key, None)
-
-        stale_pairs_dist = [key for key in self.pair_last_distance if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_dist:
-            self.pair_last_distance.pop(key, None)
-
-        stale_pairs_frame = [key for key in self.pair_last_frame if any(part not in active_track_ids for part in key.split(":"))]
-        for key in stale_pairs_frame:
-            self.pair_last_frame.pop(key, None)
-
-        stale_first_frames = [key for key in self.track_first_frame_id if key not in active_track_ids]
-        for key in stale_first_frames:
-            self.track_first_frame_id.pop(key, None)
+        """清理失效 track / pair 状态（统一由 StateRegistry 维护注册表）。"""
+        self._state.drop_stale(active_track_ids)
